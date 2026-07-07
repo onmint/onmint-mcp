@@ -1,0 +1,50 @@
+{
+  "manifest_version": "0.1",
+  "name": "onmint-authenticity",
+  "display_name": "on:mint Content Credentials",
+  "version": "0.1.0",
+  "description": "Protect originals or attach a secure EU-AI-Act label to AI-generated output, and verify the authenticity / AI content of any image — over the on:mint Content Credentials API.",
+  "author": { "name": "on:mint" },
+  "server": {
+    "type": "python",
+    "entry_point": "src/onmint_mcp/server.py",
+    "mcp_config": {
+      "command": "onmint-mcp",
+      "args": [],
+      "env": {
+        "ONMINT_API_URL": "${user_config.api_url}",
+        "ONMINT_API_KEY": "${user_config.api_key}",
+        "ONMINT_API_SECRET": "${user_config.api_secret}",
+        "ONMINT_DEFAULT_STREAM_ID": "${user_config.default_stream_id}"
+      }
+    }
+  },
+  "user_config": {
+    "api_url": {
+      "type": "string",
+      "title": "API base URL",
+      "default": "https://api.dev-onmint.com/v1",
+      "required": false
+    },
+    "api_key": {
+      "type": "string",
+      "title": "API key",
+      "description": "x-api-key from POST /register on the on:mint API",
+      "required": true,
+      "sensitive": true
+    },
+    "api_secret": {
+      "type": "string",
+      "title": "API secret",
+      "description": "x-api-secret shown once at registration",
+      "required": true,
+      "sensitive": true
+    },
+    "default_stream_id": {
+      "type": "string",
+      "title": "Default stream id (optional)",
+      "description": "Submit into this stream when a tool is called without one; otherwise a stream is reused/provisioned automatically.",
+      "required": false
+    }
+  }
+}
