@@ -70,6 +70,22 @@ docker run -p 8000:8000 \
 `manifest.json` describes an MCP bundle (`.mcpb`) for one-click install into supporting
 clients, prompting the user for their API key/secret. Build with the `mcpb` CLI.
 
+## Skill
+
+`SKILL.md` is the agent-facing description of the workflow — which tool fits which goal, and
+the caveats the tool descriptions cannot carry. The server gives an agent the *tools*; the
+skill tells it *when and how* to reach for them. Install both.
+
+`.claude/skills/onmint-authenticity/SKILL.md` symlinks the root file, so cloning this repo
+into a project already puts the skill on disk where Claude Code looks for it. To install it
+standalone:
+
+```bash
+mkdir -p ~/.claude/skills/onmint-authenticity
+curl -o ~/.claude/skills/onmint-authenticity/SKILL.md \
+  https://raw.githubusercontent.com/onmint/onmint-mcp/main/SKILL.md
+```
+
 ## Notes
 
 - `stream_id` is optional — omit it and a stream is reused/provisioned automatically
