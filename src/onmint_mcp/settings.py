@@ -18,7 +18,11 @@ POLL_TIMEOUT_SECONDS = float(os.environ.get("ONMINT_POLL_TIMEOUT_SECONDS", "1800
 # Public IPFS gateway used to fetch the credentialed (watermarked + C2PA-signed) file bytes
 # back, and the public app base for share/verify URLs.
 IPFS_GATEWAY = os.environ.get("ONMINT_IPFS_GATEWAY", "https://ipfs.pub.dev-onmint.com").rstrip("/")
-PUBLIC_APP_URL = os.environ.get("ONMINT_PUBLIC_APP_URL", "https://app.dev-onmint.com").rstrip("/")
+# Defaults to the DEV app. NOT `app.dev-onmint.com`: that legacy host is still live but is
+# served the PRODUCTION bundle by the shared webapp load balancer, so it points at the prod
+# API and its sk_live Stripe key. A dev checkout that returned there handed the payer a LIVE
+# payment link and a session/entity that do not exist in prod.
+PUBLIC_APP_URL = os.environ.get("ONMINT_PUBLIC_APP_URL", "https://app.dev.dev-onmint.com").rstrip("/")
 
 # Optional: a stream to submit into when a tool is called without one. If unset, the client
 # reuses the first existing vault/stream, else provisions a template->vault->stream.
