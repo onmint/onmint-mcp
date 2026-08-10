@@ -18,6 +18,13 @@ import httpx
 from onmint_mcp import settings
 
 _PART_SIZE = 30 * 1024 * 1024  # 30 MB — matches the backend multipart threshold
+
+# The four declarations a rights holder may choose. Mirrored here as plain strings rather
+# than imported, because this package deliberately depends on nothing but httpx and mcp — an
+# MCP server a developer installs with `pip install git+...` should not drag in the platform's
+# internal packages. The API is the authority: an unknown value is rejected there with a 422,
+# so this list can only ever be a nicer error, never a second source of truth.
+AI_DECLARATIONS = ("CREATED_WITHOUT_AI", "AI_ENHANCED", "AI_MODIFIED", "AI_GENERATED")
 _PRESIGN_READY = {"FILEDGR_RECEIVED", "FILEDGR_REVIEWED"}
 _TERMINAL = {"FILEDGR_DATA_ATTACHMENT_COMPLETED", "ERROR"}
 
@@ -55,26 +62,50 @@ class OnmintClient:
                               stream_id: str,
                               file_bytes: bytes,
                               filename: str,
+                              ai_declaration: str,
                               name: Optional[str] = None,
-                              declared_ai: Optional[bool] = None,
+                              non_ai_medium: Optional[str] = None,
+                              visible_ai_label: bool = False,
+                              allow_ai_training_and_mining: bool = False,
                               title: Optional[str] = None,
                               category: Optional[str] = None,
                               ledger: Optional[str] = None,
                               wait: bool = True) -> dict:
         """Create a submission, upload the file, and (optionally) wait for the pipeline to finish.
 
+        `ai_declaration` is REQUIRED and positional-by-convention (it sits ahead of every
+        optional argument) because the API requires it: a submission without one is rejected
+        with a 422 and no credit is spent. It is the authoritative AI label — what gets signed
+        into the C2PA manifest — so there is no default here either. Guessing it on the
+        caller's behalf would be putting words in a rights holder's mouth, cryptographically.
+
         Returns the final attachment dict. Per-file provenance (watermark_id, content_class,
         vetting verdict) lives under `files[]` once processing completes.
         """
+        if ai_declaration not in AI_DECLARATIONS:
+            raise OnmintApiError(
+                f"ai_declaration must be one of {list(AI_DECLARATIONS)}, got {ai_declaration!r}")
+
+        disclosure = {
+            "declaration": ai_declaration,
+            # Sent explicitly rather than omitted. An absent entry is an answer the server
+            # has to assume, and "did not say" and "said no" are different statements — most
+            # of all for training rights, where an unstated entry reads to a scraper as no
+            # objection recorded.
+            "visible_ai_label": visible_ai_label,
+            "allow_ai_training_and_mining": allow_ai_training_and_mining,
+        }
+        if non_ai_medium is not None:
+            disclosure["non_ai_medium"] = non_ai_medium
+
         create_body = {
             "name": name or filename,
             "stream_id": stream_id,
             "ledger": ledger or settings.DEFAULT_LEDGER,
             "filename": filename,
             "estimated_size": len(file_bytes),
+            "ai_disclosure": disclosure,
         }
-        if declared_ai is not None:
-            create_body["declared_ai"] = declared_ai
         if title is not None:
             create_body["title"] = title
         if category is not None:

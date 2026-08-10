@@ -2,12 +2,17 @@
 on:mint authenticity MCP server.
 
 Exposes the authenticity API as MCP tools so AI tools and developers can, from any MCP
-client: submit content (the mandatory AI check decides protect-vs-label), explicitly attach
-an AI-Act label to AI-generated output, protect an original, and verify/analyze any image.
+client: submit content with an AI declaration, explicitly attach an AI-Act label to
+AI-generated output, protect an original, and verify/analyze any image.
 
-Design note: the AI check ALWAYS runs server-side and its result decides the mode. A tool
-like `label_ai_output` records the caller's "this is AI" claim (recommended for AI-tool
-providers under the EU AI Act), but detection — not the claim — sets the final label.
+Design note: the AI label is DECLARED, not detected. Every submit tool sends an
+`ai_declaration` and that declaration is what gets signed into the C2PA manifest. The AI
+detector still runs server-side, and its reading is reported alongside the declaration as a
+secondary "automated assessment" that never overrides it.
+
+`submit_content` therefore REQUIRES the declaration from its caller. `label_ai_output` and
+`protect_original` hardcode one — that is what those two tools ARE, exactly as they already
+hardcoded the old `declared_ai` boolean.
 """
 import base64
 import os
@@ -43,9 +48,15 @@ def _summary(attachment: dict) -> dict:
     mode = None
     if content_class:
         mode = "labeled" if content_class in ("AI_EDITED", "AI_GENERATED") else "protected"
+    disclosure = attachment.get("ai_disclosure") or {}
     return {
         "attachment_id": attachment.get("id"),
         "status": attachment.get("status"),
+        # The authoritative label: what the rights holder declared and we signed. NOT_DECLARED
+        # on an asset minted before declarations were required — that is the honest record for
+        # those, and it must never be reported as "created without AI".
+        "ai_declaration": disclosure.get("declaration"),
+        "visible_ai_label": disclosure.get("visible_ai_label"),
         "declared_ai": attachment.get("declared_ai"),
         "watermark_id": first.get("watermark_id"),
         "content_class": content_class,
@@ -56,14 +67,17 @@ def _summary(attachment: dict) -> dict:
 
 
 async def _submit(stream_id, image_path, image_base64, filename, name, title, category,
-                  declared_ai, wait, return_file=False, save_to=None) -> dict:
+                  ai_declaration, wait, return_file=False, save_to=None,
+                  visible_ai_label=False, allow_ai_training_and_mining=False) -> dict:
     data, fname = _load(image_path, image_base64, filename)
     client = _client()
     if not stream_id:
         stream_id = await client.ensure_stream()
     attachment = await client.submit_and_wait(
         stream_id=stream_id, file_bytes=data, filename=fname, name=name,
-        declared_ai=declared_ai, title=title, category=category, wait=wait,
+        ai_declaration=ai_declaration, visible_ai_label=visible_ai_label,
+        allow_ai_training_and_mining=allow_ai_training_and_mining,
+        title=title, category=category, wait=wait,
     )
     result = _summary(attachment)
     wmid = result.get("watermark_id")
@@ -91,25 +105,39 @@ async def _submit(stream_id, image_path, image_base64, filename, name, title, ca
 
 
 @mcp.tool()
-async def submit_content(stream_id: Optional[str] = None,
+async def submit_content(ai_declaration: str,
+                         stream_id: Optional[str] = None,
                          image_path: Optional[str] = None,
                          image_base64: Optional[str] = None,
                          filename: Optional[str] = None,
                          name: Optional[str] = None,
                          title: Optional[str] = None,
                          category: Optional[str] = None,
-                         declared_ai: Optional[bool] = None,
+                         visible_ai_label: bool = False,
+                         allow_ai_training_and_mining: bool = False,
                          wait: bool = True,
                          return_file: bool = False,
                          save_to: Optional[str] = None) -> dict:
-    """Submit an image for authenticity processing. The mandatory AI check runs first and
-    its result decides the mode: an original is protected; AI-edited/AI-generated content is
-    labeled per the EU AI Act. `declared_ai` optionally records your upfront claim (does not
-    override detection). `stream_id` is optional — if omitted, a stream is reused/provisioned
-    automatically. Set `return_file` (or `save_to`) to get the credentialed file back. Returns
-    the final status, provenance, and share/verify URLs."""
+    """Submit an image for authenticity processing: invisible watermark + signed C2PA Content
+    Credentials + on-chain anchor.
+
+    `ai_declaration` is REQUIRED and has no default — it is the authoritative AI label and it
+    is signed into the credentials, so ASK THE USER rather than inferring it from the file.
+    One of CREATED_WITHOUT_AI, AI_ENHANCED, AI_MODIFIED, AI_GENERATED. Submitting without it
+    is rejected by the API and costs nothing.
+
+    `visible_ai_label` burns the visible AI label into the pixels; it is only accepted for
+    AI_MODIFIED / AI_GENERATED. `allow_ai_training_and_mining` (default false = refuse) writes
+    the standard c2pa.training-mining assertion.
+
+    An AI detector still runs and is reported alongside the declaration as a secondary
+    automated assessment; it never overrides what was declared. `stream_id` is optional — if
+    omitted, a stream is reused/provisioned automatically. Set `return_file` (or `save_to`) to
+    get the credentialed file back. Returns the final status, provenance, and verify URLs."""
     return await _submit(stream_id, image_path, image_base64, filename, name, title, category,
-                         declared_ai, wait, return_file=return_file, save_to=save_to)
+                         ai_declaration, wait, return_file=return_file, save_to=save_to,
+                         visible_ai_label=visible_ai_label,
+                         allow_ai_training_and_mining=allow_ai_training_and_mining)
 
 
 @mcp.tool()
@@ -120,16 +148,28 @@ async def label_ai_output(image_path: Optional[str] = None,
                           name: Optional[str] = None,
                           title: Optional[str] = None,
                           category: Optional[str] = None,
+                          ai_declaration: str = "AI_GENERATED",
+                          visible_ai_label: bool = False,
+                          allow_ai_training_and_mining: bool = False,
                           wait: bool = True,
                           return_file: bool = True,
                           save_to: Optional[str] = None) -> dict:
     """Attach a secure AI label to AI-generated output (for AI-tool providers, EU AI Act Art.
-    50) and get the credentialed file back. Submits with declared_ai=true; the AI check still
-    runs and, for genuine AI content, emits a C2PA digitalSourceType marking + AI-tagged
-    watermark. `stream_id` is optional (auto-provisioned). By default returns the labeled file
+    50) and get the credentialed file back.
+
+    Declares AI_GENERATED by default — that is what this tool is for, exactly as it used to
+    hardcode declared_ai=true. Override `ai_declaration` with AI_MODIFIED if AI changed an
+    existing asset rather than generating it from nothing; the other two values are not
+    appropriate here and `protect_original` is the tool for them.
+
+    The declaration is signed into the C2PA manifest as an IPTC digitalSourceType and encoded
+    in the watermark. Set `visible_ai_label=true` to also burn the visible label into the
+    pixels. `stream_id` is optional (auto-provisioned). By default returns the labeled file
     bytes (base64) plus provenance and a public verify URL; pass save_to to also write it out."""
     return await _submit(stream_id, image_path, image_base64, filename, name, title, category,
-                         declared_ai=True, wait=wait, return_file=return_file, save_to=save_to)
+                         ai_declaration, wait=wait, return_file=return_file, save_to=save_to,
+                         visible_ai_label=visible_ai_label,
+                         allow_ai_training_and_mining=allow_ai_training_and_mining)
 
 
 @mcp.tool()
@@ -140,15 +180,28 @@ async def protect_original(image_path: Optional[str] = None,
                            name: Optional[str] = None,
                            title: Optional[str] = None,
                            category: Optional[str] = None,
+                           ai_declaration: str = "CREATED_WITHOUT_AI",
+                           allow_ai_training_and_mining: bool = False,
                            wait: bool = True,
                            return_file: bool = False,
                            save_to: Optional[str] = None) -> dict:
-    """Protect an original (authored/captured) asset: submits with declared_ai=false. The AI
-    check still runs — if it detects AI content, the asset is labeled AI instead (detection
-    decides). `stream_id` is optional (auto-provisioned). Returns the final status, provenance,
-    and share/verify URLs; set return_file/save_to to also get the credentialed file."""
+    """Protect an original (authored/captured) asset.
+
+    Declares CREATED_WITHOUT_AI by default — that is what this tool is for, exactly as it used
+    to hardcode declared_ai=false. Override with AI_ENHANCED if the asset was retouched,
+    upscaled or denoised with AI: the content is still what was captured, and it is still
+    protected rather than labelled, but the declaration should say so. Only use this tool if
+    the user has confirmed it; do not assume a file is AI-free because it looks like a photo.
+
+    Our detector still runs and is reported as a secondary automated assessment. It does NOT
+    override the declaration any more — if it disagrees, both readings are published and the
+    disagreement is visible, which is the information a reviewer needs.
+
+    `stream_id` is optional (auto-provisioned). Returns the final status, provenance, and
+    verify URLs; set return_file/save_to to also get the credentialed file."""
     return await _submit(stream_id, image_path, image_base64, filename, name, title, category,
-                         declared_ai=False, wait=wait, return_file=return_file, save_to=save_to)
+                         ai_declaration, wait=wait, return_file=return_file, save_to=save_to,
+                         allow_ai_training_and_mining=allow_ai_training_and_mining)
 
 
 @mcp.tool()
@@ -166,9 +219,15 @@ async def verify_image(image_path: Optional[str] = None,
 async def analyze_image(image_path: Optional[str] = None,
                         image_base64: Optional[str] = None,
                         filename: Optional[str] = None) -> dict:
-    """Report how much AI content an image holds: AI-generated probability + label, plus the
-    per-signal breakdown (faces, NSFW, EXIF/ELA manipulation). Works on any image. These are
-    calibrated estimates from open detectors, not ground-truth verdicts."""
+    """Report the AI signals an image carries: `ai_signal_assessment` gives one of three tiers
+    (no / isolated / clear AI signals detected), plus the per-signal breakdown (faces, NSFW,
+    EXIF/ELA manipulation). Works on any image.
+
+    The old `ai_content_share` percentage has been REMOVED — it was read as "this share of the
+    image is AI", which is not what the detector measures. The raw score is still available
+    under `ai_signal_assessment.score` and `ai_generated_probability` for a technical view.
+    Present all of it as an automated assessment, never as a verdict about the asset: the
+    asset's AI label is its rights holder's declaration, not a detector's opinion."""
     data, fname = _load(image_path, image_base64, filename)
     return await _client().analyze(file_bytes=data, filename=fname)
 

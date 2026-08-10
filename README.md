@@ -3,20 +3,27 @@
 MCP server exposing the **on:mint authenticity API** — protect originals or attach an EU AI
 Act label to AI-generated content, and verify the authenticity / AI content of any image.
 
-One AI check, two modes of one pipeline: every submission is AI-checked first; originals are
-protected (watermark + C2PA + on-chain anchor) and AI content is labeled (adds a C2PA
-`digitalSourceType` marking + AI-tagged watermark). Detection decides the mode; an optional
-caller declaration is recorded only.
+**You declare, we sign.** Every submission carries a required `ai_declaration` —
+`CREATED_WITHOUT_AI`, `AI_ENHANCED`, `AI_MODIFIED` or `AI_GENERATED` — and that declaration
+is the authoritative AI label: it is written into the signed C2PA manifest as an IPTC
+`digitalSourceType` and encoded in the watermark. One pipeline either way (watermark + C2PA +
+on-chain anchor).
+
+An AI detector still runs, and it no longer decides anything. Its reading comes back as a
+secondary automated assessment in one of three tiers and never overrides the declaration.
 
 ## Tools
 
 **Content**
-- `submit_content` — submit an image; the AI check decides protect-vs-label.
-- `label_ai_output` — attach a secure AI label to AI-generated output (for AI-tool providers).
-  Returns the **credentialed file** (base64) + a public `verify_url` by default.
-- `protect_original` — protect an authored original (still AI-checked).
+- `submit_content` — submit an image. **Requires `ai_declaration`** — ask the user, do not
+  guess: it is signed in their name.
+- `label_ai_output` — attach a secure AI label to AI-generated output (for AI-tool providers);
+  declares `AI_GENERATED`. Returns the **credentialed file** (base64) + a public `verify_url`
+  by default.
+- `protect_original` — protect an authored original; declares `CREATED_WITHOUT_AI` (override
+  with `AI_ENHANCED` for AI retouching/upscaling).
 - `verify_image` — verify any image (hash → watermark → pHash) + C2PA validation.
-- `analyze_image` — report how much AI content an image holds.
+- `analyze_image` — report the AI signals an image carries, as one of three tiers.
 - `get_status` — poll a `wait=false` submission.
 - `get_provenance` — look up provenance by watermark id or SHA-256.
 
