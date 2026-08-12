@@ -65,12 +65,43 @@ onmint-mcp                        # stdio (local); or ONMINT_MCP_TRANSPORT=strea
 
 ## Hosted (streamable-http)
 
+Deployed by CI to `https://api.dev-onmint.com/mcp` (dev, on push to `dev`) and
+`https://api.app.onmint.io/mcp` (prod, on push to `main`). Manifests live in
+`filedgr-k8s-deployments/environments/{dev,prod}/services/onmint-mcp`.
+
+**Credentials travel with the request, not with the server.** One hosted process serves every
+tenant, so it holds no API key of its own: send your own `x-api-key` / `x-api-secret` on every
+request and the server acts as you. There is no fallback to the environment — an
+uncredentialed tool call fails rather than borrowing someone else's identity. `initialize`
+and `tools/list` need no credentials, so a client can connect and discover tools first.
+
+```json
+{
+  "mcpServers": {
+    "onmint": {
+      "url": "https://api.app.onmint.io/mcp",
+      "headers": {
+        "x-api-key": "YOUR_KEY",
+        "x-api-secret": "YOUR_SECRET"
+      }
+    }
+  }
+}
+```
+
+Two tool arguments behave differently here than over stdio: `image_path` and `save_to` name a
+path on the *server's* disk rather than yours, so the hosted server refuses both. Send
+`image_base64` and take the result back with `return_file=true`.
+
+Run it yourself:
+
 ```bash
 docker build -t onmint-mcp .
-docker run -p 8000:8000 \
-  -e ONMINT_API_KEY=... -e ONMINT_API_SECRET=... \
-  -e ONMINT_MCP_TRANSPORT=streamable-http onmint-mcp
+docker run -p 8000:8000 -e ONMINT_MCP_TRANSPORT=streamable-http onmint-mcp
 ```
+
+Configuration (`ONMINT_MCP_HOST`, `ONMINT_MCP_PORT`, `ONMINT_MCP_HTTP_PATH`) defaults to
+`0.0.0.0:8000/mcp`. `GET /health/live` and `/health/ready` answer for orchestrator probes.
 
 ## Bundle
 

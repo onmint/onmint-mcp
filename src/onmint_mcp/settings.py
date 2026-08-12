@@ -30,3 +30,21 @@ DEFAULT_STREAM_ID = os.environ.get("ONMINT_DEFAULT_STREAM_ID", "")
 
 # Transport: "stdio" (default, local) or "streamable-http" (hosted).
 TRANSPORT = os.environ.get("ONMINT_MCP_TRANSPORT", "stdio")
+
+# True when this process serves many callers over HTTP rather than one user over stdio.
+# Hosted mode changes two things: credentials come from each request instead of the
+# environment (see http_auth.py), and the tool arguments that touch the local filesystem are
+# refused, because "local" is then the server's disk and not the caller's.
+HOSTED = TRANSPORT != "stdio"
+
+# Bind address for the hosted transport. 0.0.0.0 because in a container the listener has to
+# be reachable from outside the pod's own loopback — FastMCP defaults to 127.0.0.1, and the
+# kubelet's probes and the Service both dial the pod IP, so the default would fail every
+# probe. Note that FastMCP passes its own defaults into pydantic-settings as init arguments,
+# and init arguments outrank environment variables there: setting FASTMCP_HOST does NOT
+# work. The value has to be handed to the FastMCP constructor, which server.py does.
+SERVER_HOST = os.environ.get("ONMINT_MCP_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("ONMINT_MCP_PORT", "8000"))
+
+# Path the streamable-http endpoint is served on, e.g. https://mcp.dev-onmint.com/mcp.
+STREAMABLE_HTTP_PATH = os.environ.get("ONMINT_MCP_HTTP_PATH", "/mcp")

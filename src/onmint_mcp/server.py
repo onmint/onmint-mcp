@@ -20,18 +20,49 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from onmint_mcp import settings
+from onmint_mcp import http_auth, settings
 from onmint_mcp.client import OnmintClient
 
-mcp = FastMCP("onmint-authenticity")
+# host/port/stateless are passed here rather than left to the environment: FastMCP forwards
+# its own constructor defaults into pydantic-settings as init arguments, which outrank env
+# vars, so FASTMCP_HOST and friends are silently ignored. stateless_http is what makes
+# per-request credentials safe — see the http_auth module docstring.
+mcp = FastMCP(
+    "onmint-authenticity",
+    host=settings.SERVER_HOST,
+    port=settings.SERVER_PORT,
+    streamable_http_path=settings.STREAMABLE_HTTP_PATH,
+    stateless_http=True,
+)
 
 
 def _client() -> OnmintClient:
+    """Build a client for whoever is calling.
+
+    Hosted, that is the API key on the in-flight HTTP request and never a server-wide
+    credential. Over stdio the process belongs to one user, so the environment is the
+    caller's own configuration and OnmintClient's defaults apply.
+    """
+    if settings.HOSTED:
+        api_key, api_secret = http_auth.require_credentials()
+        return OnmintClient(api_key=api_key, api_secret=api_secret)
     return OnmintClient()
+
+
+def _reject_local_path(argument: str, value: Optional[str]) -> None:
+    """Refuse a filesystem argument when 'the filesystem' is the server's, not the caller's."""
+    if value and settings.HOSTED:
+        raise ValueError(
+            f"`{argument}` refers to a local file path and is not available on the hosted "
+            "on:mint MCP server — the path would be read from (or written to) the server's "
+            "own disk, not yours. Send the bytes as `image_base64` instead, and take the "
+            "credentialed file back with `return_file=true`."
+        )
 
 
 def _load(image_path: Optional[str], image_base64: Optional[str], filename: Optional[str]):
     """Resolve image bytes from a local path or a base64 string (exactly one required)."""
+    _reject_local_path("image_path", image_path)
     if image_path:
         with open(image_path, "rb") as f:
             return f.read(), filename or os.path.basename(image_path)
@@ -70,6 +101,7 @@ async def _submit(stream_id, image_path, image_base64, filename, name, title, ca
                   ai_declaration, wait, return_file=False, save_to=None,
                   visible_ai_label=False, allow_ai_training_and_mining=False) -> dict:
     data, fname = _load(image_path, image_base64, filename)
+    _reject_local_path("save_to", save_to)
     client = _client()
     if not stream_id:
         stream_id = await client.ensure_stream()
@@ -302,8 +334,42 @@ async def ensure_stream() -> dict:
     return {"stream_id": await _client().ensure_stream()}
 
 
+# ================================================================== Hosted transport
+# Health endpoints for the Kubernetes probes. `custom_route` registers them outside the MCP
+# protocol and outside any authorization, which is what a probe needs: the kubelet has no
+# credentials and speaks HTTP, not MCP. They deliberately do no I/O — the API this server
+# fronts is a dependency, not part of this process's liveness, and a probe that failed when
+# the API had a bad minute would restart every pod in the middle of it.
+@mcp.custom_route("/health/live", methods=["GET"])
+async def health_live(_request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "alive"})
+
+
+@mcp.custom_route("/health/ready", methods=["GET"])
+async def health_ready(_request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ready"})
+
+
+def http_app():
+    """The hosted ASGI app: the streamable-http MCP endpoint plus per-caller credentials."""
+    http_auth.assert_stateless(mcp)
+    app = mcp.streamable_http_app()
+    app.add_middleware(http_auth.CallerCredentialsMiddleware)
+    return app
+
+
 def main() -> None:
-    mcp.run(transport=settings.TRANSPORT)
+    if not settings.HOSTED:
+        mcp.run(transport=settings.TRANSPORT)
+        return
+
+    # Served through uvicorn directly rather than mcp.run("streamable-http") so the
+    # credentials middleware can be wrapped around the app before it starts.
+    import uvicorn
+
+    uvicorn.run(http_app(), host=settings.SERVER_HOST, port=settings.SERVER_PORT)
 
 
 if __name__ == "__main__":
