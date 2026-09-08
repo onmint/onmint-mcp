@@ -1,5 +1,12 @@
 name: Build and Deploy to Scaleway K8s
 
+# One deploy at a time per branch. Two pushes in quick succession used to interleave
+# sed / apply / migrate against the same Deployment. Never cancel a running deploy:
+# a half-applied rollout is worse than a queued one.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 # Mirrors the deploy workflow every other on:mint service uses (onmint-service-nft is the
 # reference). Two differences, both because of what this service is:
 #   - no database, so no migration step;
@@ -158,8 +165,34 @@ jobs:
           path: k8s-deployments
 
       - name: Install Scaleway CLI
+        # Pinned and downloaded directly, NOT via scaleway-cli's get.sh. That script asks
+        # the GitHub API for the latest release unauthenticated, so it is rate limited by
+        # the shared Actions runner IP - it answered "Unable to find the latest
+        # linux_amd64 release" and failed a deploy whose image had already been built and
+        # pushed. Nothing about a deploy should depend on an anonymous API call, and a
+        # deploy tool that silently upgrades itself on every run is not reproducible
+        # either. Bump SCW_CLI_VERSION deliberately.
+        env:
+          SCW_CLI_VERSION: 2.61.0
         run: |
-          curl -s https://raw.githubusercontent.com/scaleway/scaleway-cli/master/scripts/get.sh | sh
+          set -euo pipefail
+          asset="scaleway-cli_${SCW_CLI_VERSION}_linux_amd64"
+          base="https://github.com/scaleway/scaleway-cli/releases/download/v${SCW_CLI_VERSION}"
+
+          curl -fsSL --retry 3 --retry-delay 5 -o scw "${base}/${asset}"
+          curl -fsSL --retry 3 --retry-delay 5 -o SHA256SUMS "${base}/SHA256SUMS"
+
+          # Catches a truncated or half-written download, which otherwise surfaces much
+          # later as an unreadable error from a binary that will not run.
+          sum=$(awk -v a="$asset" '$2 == a { print $1 }' SHA256SUMS)
+          if [ -z "$sum" ]; then
+            echo "::error::No checksum for $asset in the v${SCW_CLI_VERSION} SHA256SUMS."
+            exit 1
+          fi
+          echo "$sum  scw" | sha256sum -c -
+
+          chmod +x scw
+          sudo mv scw /usr/local/bin/scw
           scw version
 
       - name: Configure Scaleway CLI
