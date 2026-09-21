@@ -99,7 +99,8 @@ def _summary(attachment: dict) -> dict:
 
 async def _submit(stream_id, image_path, image_base64, filename, name, title, category,
                   ai_declaration, wait, return_file=False, save_to=None,
-                  visible_ai_label=False, allow_ai_training_and_mining=False) -> dict:
+                  visible_ai_label=False, allow_ai_training_and_mining=False,
+                  label_template=None) -> dict:
     data, fname = _load(image_path, image_base64, filename)
     _reject_local_path("save_to", save_to)
     client = _client()
@@ -109,7 +110,7 @@ async def _submit(stream_id, image_path, image_base64, filename, name, title, ca
         stream_id=stream_id, file_bytes=data, filename=fname, name=name,
         ai_declaration=ai_declaration, visible_ai_label=visible_ai_label,
         allow_ai_training_and_mining=allow_ai_training_and_mining,
-        title=title, category=category, wait=wait,
+        title=title, category=category, wait=wait, label_template=label_template,
     )
     result = _summary(attachment)
     wmid = result.get("watermark_id")
@@ -149,7 +150,8 @@ async def submit_content(ai_declaration: str,
                          allow_ai_training_and_mining: bool = False,
                          wait: bool = True,
                          return_file: bool = False,
-                         save_to: Optional[str] = None) -> dict:
+                         save_to: Optional[str] = None,
+                         label_template: Optional[str] = None) -> dict:
     """Submit an image for authenticity processing: invisible watermark + signed C2PA Content
     Credentials + on-chain anchor.
 
@@ -165,11 +167,19 @@ async def submit_content(ai_declaration: str,
     An AI detector still runs and is reported alongside the declaration as a secondary
     automated assessment; it never overrides what was declared. `stream_id` is optional — if
     omitted, a stream is reused/provisioned automatically. Set `return_file` (or `save_to`) to
-    get the credentialed file back. Returns the final status, provenance, and verify URLs."""
+    get the credentialed file back. Returns the final status, provenance, and verify URLs.
+
+    `label_template`: id of one of the organization's label templates; it sets how the
+    visible AI label LOOKS (artwork, frame, colour, logo), never what it says, and only shows
+    when a visible label is drawn (`visible_ai_label=true`). Omit it to use
+    the organization's default. Call `list_label_templates` to find an id. An unknown id is
+    refused (MINTYS_TEMPLATE_UNKNOWN) and nothing is submitted or labelled with a substitute.
+    """
     return await _submit(stream_id, image_path, image_base64, filename, name, title, category,
                          ai_declaration, wait, return_file=return_file, save_to=save_to,
                          visible_ai_label=visible_ai_label,
-                         allow_ai_training_and_mining=allow_ai_training_and_mining)
+                         allow_ai_training_and_mining=allow_ai_training_and_mining,
+                         label_template=label_template)
 
 
 @mcp.tool()
@@ -185,7 +195,8 @@ async def label_ai_output(image_path: Optional[str] = None,
                           allow_ai_training_and_mining: bool = False,
                           wait: bool = True,
                           return_file: bool = True,
-                          save_to: Optional[str] = None) -> dict:
+                          save_to: Optional[str] = None,
+                          label_template: Optional[str] = None) -> dict:
     """Attach a secure AI label to AI-generated output (for AI-tool providers, EU AI Act Art.
     50) and get the credentialed file back.
 
@@ -197,11 +208,19 @@ async def label_ai_output(image_path: Optional[str] = None,
     The declaration is signed into the C2PA manifest as an IPTC digitalSourceType and encoded
     in the watermark. Set `visible_ai_label=true` to also burn the visible label into the
     pixels. `stream_id` is optional (auto-provisioned). By default returns the labeled file
-    bytes (base64) plus provenance and a public verify URL; pass save_to to also write it out."""
+    bytes (base64) plus provenance and a public verify URL; pass save_to to also write it out.
+
+    `label_template`: id of one of the organization's label templates; it sets how the
+    visible AI label LOOKS (artwork, frame, colour, logo), never what it says, and only shows
+    when a visible label is drawn (`visible_ai_label=true`). Omit it to use
+    the organization's default. Call `list_label_templates` to find an id. An unknown id is
+    refused (MINTYS_TEMPLATE_UNKNOWN) and nothing is submitted or labelled with a substitute.
+    """
     return await _submit(stream_id, image_path, image_base64, filename, name, title, category,
                          ai_declaration, wait=wait, return_file=return_file, save_to=save_to,
                          visible_ai_label=visible_ai_label,
-                         allow_ai_training_and_mining=allow_ai_training_and_mining)
+                         allow_ai_training_and_mining=allow_ai_training_and_mining,
+                         label_template=label_template)
 
 
 @mcp.tool()
@@ -216,7 +235,8 @@ async def protect_original(image_path: Optional[str] = None,
                            allow_ai_training_and_mining: bool = False,
                            wait: bool = True,
                            return_file: bool = False,
-                           save_to: Optional[str] = None) -> dict:
+                           save_to: Optional[str] = None,
+                           label_template: Optional[str] = None) -> dict:
     """Protect an original (authored/captured) asset.
 
     Declares CREATED_WITHOUT_AI by default — that is what this tool is for, exactly as it used
@@ -230,10 +250,20 @@ async def protect_original(image_path: Optional[str] = None,
     disagreement is visible, which is the information a reviewer needs.
 
     `stream_id` is optional (auto-provisioned). Returns the final status, provenance, and
-    verify URLs; set return_file/save_to to also get the credentialed file."""
+    verify URLs; set return_file/save_to to also get the credentialed file.
+
+    `label_template` is accepted for parity but changes nothing visible here: this tool draws
+    no visible label. It is still validated, so an unknown id is still refused.
+
+    `label_template`: id of one of the organization's label templates; it sets how the
+    visible AI label LOOKS (artwork, frame, colour, logo), never what it says. Omit it to use
+    the organization's default. Call `list_label_templates` to find an id. An unknown id is
+    refused (MINTYS_TEMPLATE_UNKNOWN) and nothing is submitted or labelled with a substitute.
+    """
     return await _submit(stream_id, image_path, image_base64, filename, name, title, category,
                          ai_declaration, wait=wait, return_file=return_file, save_to=save_to,
-                         allow_ai_training_and_mining=allow_ai_training_and_mining)
+                         allow_ai_training_and_mining=allow_ai_training_and_mining,
+                         label_template=label_template)
 
 
 @mcp.tool()

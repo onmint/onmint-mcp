@@ -18,8 +18,11 @@ import httpx
 import pytest
 
 from onmint_mcp import settings
-from onmint_mcp.client import OnmintApiError, OnmintClient
+from onmint_mcp.client import LabelTemplateUnknownError, OnmintApiError, OnmintClient
 from onmint_mcp import server
+
+TEMPLATE_ID = "3f0c9a52-6d1e-4c8b-9a57-0e2f4b1d7c11"
+UNKNOWN_TEMPLATE = "00000000-0000-4000-8000-000000000000"
 
 
 def make_transport(state):
@@ -42,6 +45,12 @@ def make_transport(state):
                 return httpx.Response(422, json={"detail": [
                     {"type": "missing", "loc": ["body", "ai_disclosure"],
                      "msg": "Field required"}]})
+            # Mirrors the API's refusal of a template id the organization does not have:
+            # 400 with a stable code, and nothing created.
+            if body.get("label_template") == UNKNOWN_TEMPLATE:
+                return httpx.Response(400, json={
+                    "error": "MINTYS_TEMPLATE_UNKNOWN",
+                    "message": "That label template does not exist."})
             return httpx.Response(200, json={"id": "att1"})
         if path == "/v1/authenticity/attachments/att1" and method == "GET":
             if not state.get("uploaded"):
@@ -208,3 +217,60 @@ def test_the_summary_reports_the_declaration_that_was_signed(monkeypatch):
 
     assert result["ai_declaration"] == "AI_GENERATED"
     assert result["content_class"] == "AI_GENERATED"
+
+
+# ------------------------------------------------------------ label_template (ONMINT-856)
+# Omitted must stay OMITTED on the wire: the API reads an absent field as "use the
+# organization's default", and an explicit null is a different request.
+_SUBMIT_TOOLS = [
+    ("submit_content", {"ai_declaration": "AI_GENERATED"}),
+    ("label_ai_output", {}),
+    ("protect_original", {}),
+]
+
+
+@pytest.mark.parametrize("tool,extra", _SUBMIT_TOOLS)
+def test_label_template_omitted_is_absent_from_the_body(monkeypatch, tool, extra):
+    state = {}
+    monkeypatch.setattr(server, "_client", lambda: client(state))
+    img_b64 = base64.b64encode(b"input").decode()
+
+    asyncio.run(getattr(server, tool)(image_base64=img_b64, filename="a.png",
+                                      stream_id="s1", **extra))
+
+    assert "label_template" not in state["create_body"]
+
+
+@pytest.mark.parametrize("tool,extra", _SUBMIT_TOOLS)
+def test_label_template_given_is_sent_verbatim(monkeypatch, tool, extra):
+    state = {}
+    monkeypatch.setattr(server, "_client", lambda: client(state))
+    img_b64 = base64.b64encode(b"input").decode()
+
+    asyncio.run(getattr(server, tool)(image_base64=img_b64, filename="a.png",
+                                      stream_id="s1", label_template=TEMPLATE_ID, **extra))
+
+    assert state["create_body"]["label_template"] == TEMPLATE_ID
+
+
+def test_submit_and_wait_omits_label_template_by_default():
+    state = {}
+    asyncio.run(client(state).submit_and_wait(
+        stream_id="s1", file_bytes=b"img", filename="a.png", ai_declaration="AI_GENERATED"))
+    assert "label_template" not in state["create_body"]
+
+
+def test_an_unknown_label_template_is_refused_not_substituted(monkeypatch):
+    """The refusal surfaces as its own error that tells the calling model what to do, and
+    nothing is uploaded — there is no fallback to the default template."""
+    state = {}
+    monkeypatch.setattr(server, "_client", lambda: client(state))
+    img_b64 = base64.b64encode(b"input").decode()
+
+    with pytest.raises(LabelTemplateUnknownError) as exc:
+        asyncio.run(server.label_ai_output(image_base64=img_b64, filename="a.png",
+                                           stream_id="s1", label_template=UNKNOWN_TEMPLATE))
+
+    assert "list_label_templates" in str(exc.value)
+    assert "substitute" in str(exc.value)
+    assert not state.get("uploaded")

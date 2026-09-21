@@ -33,6 +33,36 @@ class OnmintApiError(RuntimeError):
     pass
 
 
+# The stable code the API answers a `label_template` it cannot resolve with.
+TEMPLATE_UNKNOWN = "MINTYS_TEMPLATE_UNKNOWN"
+
+
+class LabelTemplateUnknownError(OnmintApiError):
+    """`label_template` names a template the organization does not have.
+
+    Its own type because the right reaction differs from every other 400: nothing was
+    submitted and nothing was labelled with a substitute, and the fix is to re-read the
+    templates, not to change code. The message says so, since it is what a calling model reads.
+    """
+
+
+def _raise_for(method: str, path: str, resp: httpx.Response) -> None:
+    if resp.status_code < 400:
+        return
+    if resp.status_code == 400:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and body.get("error") == TEMPLATE_UNKNOWN:
+            raise LabelTemplateUnknownError(
+                f"{TEMPLATE_UNKNOWN}: the label_template id is not one of this organization's "
+                "label templates. Nothing was submitted and nothing was labelled with a "
+                "substitute template. Call list_label_templates for the valid ids, or omit "
+                "label_template to use the organization's default.")
+    raise OnmintApiError(f"{method} {path} -> {resp.status_code}: {resp.text[:400]}")
+
+
 class OnmintClient:
     def __init__(self,
                  base_url: Optional[str] = None,
@@ -53,8 +83,7 @@ class OnmintClient:
         url = f"{self._base}{path}"
         async with self._client() as c:
             resp = await c.request(method, url, headers=self._headers, **kw)
-        if resp.status_code >= 400:
-            raise OnmintApiError(f"{method} {path} -> {resp.status_code}: {resp.text[:400]}")
+        _raise_for(method, path, resp)
         return resp.json() if resp.content else None
 
     # --------------------------------------------------------------- submit
@@ -70,7 +99,8 @@ class OnmintClient:
                               title: Optional[str] = None,
                               category: Optional[str] = None,
                               ledger: Optional[str] = None,
-                              wait: bool = True) -> dict:
+                              wait: bool = True,
+                              label_template: Optional[str] = None) -> dict:
         """Create a submission, upload the file, and (optionally) wait for the pipeline to finish.
 
         `ai_declaration` is REQUIRED and positional-by-convention (it sits ahead of every
@@ -78,6 +108,12 @@ class OnmintClient:
         with a 422 and no credit is spent. It is the authoritative AI label — what gets signed
         into the C2PA manifest — so there is no default here either. Guessing it on the
         caller's behalf would be putting words in a rights holder's mouth, cryptographically.
+
+        `label_template` names one of the organization's label templates (how the visible
+        label LOOKS). It is put on the wire only when given: an omitted field is what tells
+        the API to use the organization's default, and an explicit null is a different
+        request. An id the account does not have is refused with 400
+        MINTYS_TEMPLATE_UNKNOWN before anything is created, never swapped for the default.
 
         Returns the final attachment dict. Per-file provenance (watermark_id, content_class,
         vetting verdict) lives under `files[]` once processing completes.
@@ -110,6 +146,8 @@ class OnmintClient:
             create_body["title"] = title
         if category is not None:
             create_body["category"] = category
+        if label_template is not None:
+            create_body["label_template"] = label_template
 
         created = await self._json("POST", "/authenticity/attachments", json=create_body)
         attachment_id = created["id"]
