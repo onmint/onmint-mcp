@@ -3,7 +3,8 @@ on:mint authenticity MCP server.
 
 Exposes the authenticity API as MCP tools so AI tools and developers can, from any MCP
 client: submit content with an AI declaration, explicitly attach an AI-Act label to
-AI-generated output, protect an original, and verify/analyze any image.
+AI-generated output, protect an original, and verify/analyze any image. mintys customers
+label an image or a zip batch through the mintys job pipeline (`mintys_label_images`).
 
 Design note: the AI label is DECLARED, not detected. Every submit tool sends an
 `ai_declaration` and that declaration is what gets signed into the C2PA manifest. The AI
@@ -210,6 +211,9 @@ async def label_ai_output(image_path: Optional[str] = None,
     pixels. `stream_id` is optional (auto-provisioned). By default returns the labeled file
     bytes (base64) plus provenance and a public verify URL; pass save_to to also write it out.
 
+    This is the on:mint pipeline (stream, IPFS, on-chain anchor). mintys customers labelling
+    an image or a zip batch use `mintys_label_images` instead.
+
     `label_template`: id of one of the organization's label templates; it sets how the
     visible AI label LOOKS (artwork, frame, colour, logo), never what it says, and only shows
     when a visible label is drawn (`visible_ai_label=true`). Omit it to use
@@ -314,6 +318,139 @@ async def get_provenance(watermark_id: Optional[str] = None,
     raise ValueError("Provide either watermark_id or sha256.")
 
 
+# ============================================================ mintys jobs
+# mintys is its own pipeline, not a mode of the on:mint one: no stream, no IPFS pin, no
+# on-chain anchor, one declaration (or auto_label) per job, and the output comes back as a
+# download that expires. Folding it into label_ai_output would silently change that tool's
+# inputs and its return shape, so it is a tool of its own and each docstring names the other.
+def _mintys_template(job: dict) -> dict:
+    """The template applied to a job, as {id, name}, whichever shape the API reports it in."""
+    nested = job.get("label_template")
+    if isinstance(nested, dict):
+        return {"id": nested.get("id"), "name": nested.get("name")}
+    return {"id": job.get("label_template_id"), "name": job.get("label_template_name")}
+
+
+def _mintys_summary(job: dict) -> dict:
+    items = job.get("items") or []
+    failed = [{"filename": i.get("filename"), "failure_reason": i.get("failure_reason"),
+               "failure_detail": i.get("failure_detail")}
+              for i in items if i.get("status") == "FAILED"]
+    return {
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "total": job.get("total"),
+        "done": job.get("done"),
+        "skipped": job.get("skipped"),
+        "failed": job.get("failed"),
+        "failed_items": failed,
+        "credits_spent": job.get("credits_spent"),
+        "label_template": _mintys_template(job),
+        "result_available": job.get("result_available"),
+        "expires_at": job.get("expires_at"),
+    }
+
+
+async def _attach_mintys_result(client: OnmintClient, result: dict, job_id: str,
+                                return_file: bool, save_to: Optional[str]) -> dict:
+    if not (return_file or save_to):
+        return result
+    try:
+        data, name, content_type = await client.get_mintys_job_result(job_id)
+    except Exception as ex:  # the job itself is reported either way
+        result["result_error"] = str(ex)
+        return result
+    if save_to:
+        with open(save_to, "wb") as fh:
+            fh.write(data)
+        result["saved_to"] = save_to
+    if return_file:
+        result["result_file_base64"] = base64.b64encode(data).decode()
+        result["result_file_name"] = name
+        result["result_content_type"] = content_type
+    return result
+
+
+@mcp.tool()
+async def mintys_label_images(image_path: Optional[str] = None,
+                              image_base64: Optional[str] = None,
+                              filename: Optional[str] = None,
+                              ai_declaration: Optional[str] = None,
+                              auto_label: bool = False,
+                              visible_label: bool = False,
+                              label_position: Optional[str] = None,
+                              label_variant: Optional[str] = None,
+                              label_template: Optional[str] = None,
+                              title: Optional[str] = None,
+                              description: Optional[str] = None,
+                              wait: bool = True,
+                              return_file: bool = True,
+                              save_to: Optional[str] = None) -> dict:
+    """mintys: label one image, or a .zip of images, through the mintys job pipeline (AI
+    check, visible EU AI Act label, invisible watermark, signed C2PA credentials). For mintys
+    customers. No stream, IPFS or on-chain anchor; for that on:mint pipeline use
+    `label_ai_output` instead.
+
+    Exactly one of `ai_declaration` (CREATED_WITHOUT_AI, AI_ENHANCED, AI_MODIFIED,
+    AI_GENERATED; applied to EVERY file in the upload, so ask the user) or `auto_label=true`
+    (the AI check decides per file; a file it clears comes back SKIPPED, which is a success).
+    `visible_label=true` burns in the visible label; `label_position` is top_right (default),
+    top_left, bottom_right or bottom_left; omit `label_variant` to pick it automatically.
+    Sending base64, set `filename` (e.g. batch.zip) so the type is known.
+
+    `label_template`: id of one of the organization's label templates; it sets how the
+    visible label LOOKS (artwork, frame, colour, logo), never what it says, and applies to
+    the whole job. Omit it to use the organization's default. Call `list_label_templates` to
+    find an id. An unknown id is refused (MINTYS_TEMPLATE_UNKNOWN) and nothing is labelled
+    with a substitute. The applied template's id and name are recorded on the job and
+    returned as `label_template`.
+
+    With `wait=true` (default) polls until the job finishes and returns counts, failed files,
+    the applied template and, with `return_file` (default) or `save_to`, the labelled output
+    (a zip for a zip upload). With `wait=false` returns the job id at once; follow up with
+    `get_mintys_job`. The output is temporary: download it before `expires_at`."""
+    data, fname = _load(image_path, image_base64, filename)
+    _reject_local_path("save_to", save_to)
+    client = _client()
+    accepted = await client.submit_mintys_job(
+        file_bytes=data, filename=fname, ai_declaration=ai_declaration, auto_label=auto_label,
+        visible_label=visible_label, label_position=label_position,
+        label_variant=label_variant, label_template=label_template, title=title,
+        description=description)
+    job_id = str(accepted["job_id"])
+    if not wait:
+        result = _mintys_summary(await client.get_mintys_job(job_id))
+        result.update(accepted=accepted.get("accepted"),
+                      credits_reserved=accepted.get("credits_reserved"))
+        return result
+    result = _mintys_summary(await client.wait_mintys_job(job_id))
+    result.update(accepted=accepted.get("accepted"),
+                  credits_reserved=accepted.get("credits_reserved"))
+    return await _attach_mintys_result(client, result, job_id, return_file, save_to)
+
+
+@mcp.tool()
+async def get_mintys_job(job_id: str, return_file: bool = False,
+                         save_to: Optional[str] = None) -> dict:
+    """mintys: progress of a job from `mintys_label_images` (e.g. one submitted with
+    wait=false): status, done/skipped/failed counts, failed files, and the label template
+    applied (`label_template` {id, name}). Set `return_file` or `save_to` to also fetch the
+    labelled output once `result_available` is true; before that, or after `expires_at`, the
+    download is refused and reported under `result_error`."""
+    _reject_local_path("save_to", save_to)
+    client = _client()
+    result = _mintys_summary(await client.get_mintys_job(job_id))
+    return await _attach_mintys_result(client, result, job_id, return_file, save_to)
+
+
+@mcp.tool()
+async def delete_mintys_job(job_id: str) -> dict:
+    """mintys: delete a job's temporary output now instead of waiting for `expires_at`. An
+    unknown job id is an error, not a success."""
+    await _client().delete_mintys_job(job_id)
+    return {"job_id": job_id, "deleted": True}
+
+
 # ============================================================ Label templates
 # Deliberately NOT named `list_templates`: that tool already exists and lists the asset
 # templates of the provisioning graph. Two tools both called "templates" is how a calling
@@ -323,8 +460,8 @@ async def list_label_templates() -> dict:
     """List the organization's LABEL templates: how the visible AI label LOOKS (artwork,
     frame, colour, logo). Returns `templates` [{id, name, is_default}] and `default_id`.
 
-    Pass an `id` from here as `label_template` to label_ai_output, submit_content or
-    protect_original. Omitting `label_template` uses the template marked
+    Pass an `id` from here as `label_template` to mintys_label_images, label_ai_output,
+    submit_content or protect_original. Omitting `label_template` uses the template marked
     `is_default`; an id not in this list is refused and nothing is labelled with a
     substitute. Templates are created and edited in the web app, not through this tool.
 

@@ -235,6 +235,75 @@ class OnmintClient:
             raise OnmintApiError(f"IPFS fetch {cid} -> {resp.status_code}")
         return resp.content
 
+    # ------------------------------------------------------------ mintys jobs
+    async def submit_mintys_job(self,
+                                file_bytes: bytes,
+                                filename: str,
+                                ai_declaration: Optional[str] = None,
+                                auto_label: bool = False,
+                                visible_label: bool = False,
+                                label_position: Optional[str] = None,
+                                label_variant: Optional[str] = None,
+                                label_template: Optional[str] = None,
+                                title: Optional[str] = None,
+                                description: Optional[str] = None) -> dict:
+        """POST /mintys/jobs: one image or one zip, one set of answers for every entry.
+
+        `ai_declaration` and `auto_label` are two answers to one question and exactly one is
+        required; checked here for a clearer error than the API's 400, which stays the
+        authority. Optional fields go on the form only when given — above all
+        `label_template`, where an absent field is what means "the organization's default".
+        Returns the 202 body: job_id, accepted, total, credits_reserved.
+        """
+        if auto_label and ai_declaration is not None:
+            raise OnmintApiError("send ai_declaration OR auto_label=true, not both")
+        if not auto_label and ai_declaration is None:
+            raise OnmintApiError("ai_declaration is required unless auto_label=true")
+        if ai_declaration is not None and ai_declaration not in AI_DECLARATIONS:
+            raise OnmintApiError(
+                f"ai_declaration must be one of {list(AI_DECLARATIONS)}, got {ai_declaration!r}")
+
+        form = {"auto_label": _flag(auto_label), "visible_label": _flag(visible_label)}
+        optional = {"ai_disclosure": ai_declaration, "label_position": label_position,
+                    "label_variant": label_variant, "label_template": label_template,
+                    "title": title, "description": description}
+        form.update({k: str(v) for k, v in optional.items() if v is not None})
+        files = {"file": (filename, file_bytes, _mime(filename))}
+        return await self._json("POST", "/mintys/jobs", data=form, files=files)
+
+    async def get_mintys_job(self, job_id: str) -> dict:
+        return await self._json("GET", f"/mintys/jobs/{job_id}")
+
+    async def wait_mintys_job(self, job_id: str) -> dict:
+        """Poll until the job has finished: FAILED, or DONE with its result ready to download.
+
+        A job is DONE even when some entries failed (the rows say which); FAILED means none
+        succeeded. DONE is not enough on its own because the result may still be assembling.
+        """
+        waited = 0.0
+        while waited <= settings.POLL_TIMEOUT_SECONDS:
+            job = await self.get_mintys_job(job_id)
+            status = job.get("status")
+            if status == "FAILED" or (status == "DONE" and job.get("result_available")):
+                return job
+            await asyncio.sleep(settings.POLL_INTERVAL_SECONDS)
+            waited += settings.POLL_INTERVAL_SECONDS
+        raise OnmintApiError(f"timed out waiting for mintys job {job_id} to finish")
+
+    async def get_mintys_job_result(self, job_id: str) -> tuple[bytes, str, str]:
+        """The labelled output: (bytes, filename, content type). 409 while the job is still
+        running, 410 once the temporary result has expired."""
+        path = f"/mintys/jobs/{job_id}/result"
+        async with self._client() as c:
+            resp = await c.get(f"{self._base}{path}", headers=self._headers)
+        _raise_for("GET", path, resp)
+        filename = _disposition_filename(resp.headers.get("content-disposition"))
+        content_type = resp.headers.get("content-type", "application/octet-stream")
+        return resp.content, filename or f"mintys-job-{job_id}.zip", content_type
+
+    async def delete_mintys_job(self, job_id: str) -> None:
+        await self._json("DELETE", f"/mintys/jobs/{job_id}")
+
     # ------------------------------------------------------------ label templates
     async def list_label_templates(self) -> dict:
         """The organization's LABEL templates (how the visible AI label looks), reduced to what
@@ -325,6 +394,20 @@ def _id_of(obj: Optional[dict]) -> str:
         if nested.get("id"):
             return nested["id"]
     raise OnmintApiError(f"no id in provisioning response: {list(obj)[:6]}")
+
+
+def _flag(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _disposition_filename(header: Optional[str]) -> Optional[str]:
+    """The filename of a Content-Disposition header (plain `filename`, or `filename*` alone)."""
+    if not header:
+        return None
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["content-disposition"] = header
+    return msg.get_filename()
 
 
 def _mime(filename: str) -> str:

@@ -79,7 +79,8 @@ def test_every_tool_taking_label_template_states_the_rules():
     where to find an id, and that an unknown id is refused rather than substituted."""
     tools = asyncio.run(server.mcp.list_tools())
     taking = [t for t in tools if "label_template" in (t.inputSchema.get("properties") or {})]
-    assert {t.name for t in taking} >= {"submit_content", "label_ai_output", "protect_original"}
+    assert {t.name for t in taking} >= {"submit_content", "label_ai_output", "protect_original",
+                                       "mintys_label_images"}
     for t in taking:
         d = " ".join((t.description or "").split())
         assert "Omit it to use the organization's default" in d, t.name
