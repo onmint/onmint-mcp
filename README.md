@@ -27,9 +27,25 @@ secondary automated assessment in one of three tiers and never overrides the dec
 - `get_status` — poll a `wait=false` submission.
 - `get_provenance` — look up provenance by watermark id or SHA-256.
 
+**mintys** (the mintys job pipeline: no stream, no IPFS, no on-chain anchor)
+- `mintys_label_images` — label one image or a `.zip` batch. One `ai_declaration` for the
+  whole upload, or `auto_label=true`. Waits and returns the labelled output by default.
+- `get_mintys_job` / `delete_mintys_job` — poll a `wait=false` job (and fetch its output),
+  or drop its temporary output early.
+
+**Label templates** — how the visible AI label looks
+- `list_label_templates` — the organization's label templates: `id`, `name`, `is_default`.
+
+`label_template` is an optional argument of `mintys_label_images`, `label_ai_output`,
+`submit_content` and `protect_original`. Omit it to use the organization's default. An id
+the organization does not have is refused (`MINTYS_TEMPLATE_UNKNOWN`) and nothing is
+labelled with a substitute. The template applied to a mintys job is reported back as
+`label_template` `{id, name}`.
+
 **Provisioning** (set up a place to submit, over the API — no web app needed)
 - `ensure_stream` — get a ready-to-use stream id (reuse or auto-provision).
 - `list_vaults` / `list_streams` / `list_templates` — discover existing resources.
+  `list_templates` lists **asset** templates, not label templates.
 - `create_template` / `create_vault` / `create_stream` — build the graph explicitly.
 
 The submit tools take an optional `stream_id`; when omitted they call `ensure_stream`, so a

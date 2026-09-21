@@ -51,7 +51,14 @@ the pixels (only accepted for `AI_MODIFIED` / `AI_GENERATED`), and
 | Poll a `wait=false` submission | `get_status` |
 | Look up an asset's provenance by watermark id / SHA-256 | `get_provenance` |
 | Get a ready-to-submit stream (reuse or auto-provision) | `ensure_stream` |
-| List / create templates, vaults, streams over the API | `list_*` / `create_template` / `create_vault` / `create_stream` |
+| mintys: label one image or a zip batch through the mintys job pipeline | `mintys_label_images` |
+| mintys: poll a `wait=false` job, fetch its output, or drop it early | `get_mintys_job` / `delete_mintys_job` |
+| Find a `label_template` id (how the visible AI label looks) | `list_label_templates` |
+| List / create ASSET templates, vaults, streams over the API (not label templates) | `list_*` / `create_template` / `create_vault` / `create_stream` |
+
+`label_template` (on `mintys_label_images`, `label_ai_output`, `submit_content`,
+`protect_original`): omit it to use the organization's default; take an id from
+`list_label_templates`. An unknown id is refused and nothing is labelled with a substitute.
 
 `label_ai_output` returns the **credentialed file** (base64) plus a public `verify_url` by
 default; pass `save_to=<path>` to also write it. All submit tools take an **optional**
