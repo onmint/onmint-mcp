@@ -235,6 +235,20 @@ class OnmintClient:
             raise OnmintApiError(f"IPFS fetch {cid} -> {resp.status_code}")
         return resp.content
 
+    # ------------------------------------------------------------ label templates
+    async def list_label_templates(self) -> dict:
+        """The organization's LABEL templates (how the visible AI label looks), reduced to what
+        a caller needs to choose one: id, name, and which one is the default.
+
+        Unrelated to `list_templates`, which lists ASSET templates for provisioning.
+        """
+        raw = await self._json("GET", "/mintys/label-templates")
+        items = raw.get("content", []) if isinstance(raw, dict) else (raw or [])
+        templates = [{"id": t.get("id"), "name": t.get("name"),
+                      "is_default": bool(t.get("is_default"))} for t in items]
+        default = next((t["id"] for t in templates if t["is_default"]), None)
+        return {"templates": templates, "default_id": default}
+
     # -------------------------------------------- provisioning (templates/vaults/streams)
     async def list_templates(self, page: int = 1, page_size: int = 20,
                              public: bool = False, search_term: str = "") -> Optional[dict]:

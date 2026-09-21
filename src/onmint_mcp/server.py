@@ -314,6 +314,24 @@ async def get_provenance(watermark_id: Optional[str] = None,
     raise ValueError("Provide either watermark_id or sha256.")
 
 
+# ============================================================ Label templates
+# Deliberately NOT named `list_templates`: that tool already exists and lists the asset
+# templates of the provisioning graph. Two tools both called "templates" is how a calling
+# model picks the wrong one without noticing, so the names and the docstrings each say which.
+@mcp.tool()
+async def list_label_templates() -> dict:
+    """List the organization's LABEL templates: how the visible AI label LOOKS (artwork,
+    frame, colour, logo). Returns `templates` [{id, name, is_default}] and `default_id`.
+
+    Pass an `id` from here as `label_template` to label_ai_output, submit_content or
+    protect_original. Omitting `label_template` uses the template marked
+    `is_default`; an id not in this list is refused and nothing is labelled with a
+    substitute. Templates are created and edited in the web app, not through this tool.
+
+    Not the asset templates `list_templates` returns; those are a different thing."""
+    return await _client().list_label_templates()
+
+
 # ============================================================ Provisioning (P4)
 # Manage the template -> vault -> stream graph over the API, so a developer can set up a place
 # to submit content without touching the web app.
@@ -332,14 +350,19 @@ async def list_streams(vault_id: str, page: int = 1, page_size: int = 20) -> dic
 @mcp.tool()
 async def list_templates(page: int = 1, page_size: int = 20,
                          public: bool = False, search_term: str = "") -> dict:
-    """List templates available to you (optionally public / filtered by search term)."""
+    """List ASSET templates: step 1 of the template -> vault -> stream graph that on:mint
+    submissions go into (optionally public / filtered by search term).
+
+    NOT label templates. These ids are never valid as `label_template`; for how the visible
+    AI label looks, call `list_label_templates`."""
     return await _client().list_templates(page=page, page_size=page_size,
                                           public=public, search_term=search_term) or {"content": []}
 
 
 @mcp.tool()
 async def create_template(name: str, hint: str = "authenticity", public: bool = False) -> dict:
-    """Create a headless template (step 1 of provisioning a place to submit). Returns the template."""
+    """Create a headless ASSET template (step 1 of provisioning a place to submit). Returns the
+    template. Not a label template: those are created in the web app, not over the API."""
     return await _client().create_template(name=name, hint=hint, public=public)
 
 
