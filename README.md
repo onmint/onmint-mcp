@@ -19,17 +19,20 @@ declaration.
 | Format | What a submission gets |
 |---|---|
 | JPEG, PNG, WebP, TIFF | **Full pipeline**: invisible watermark + C2PA Content Credentials embedded in the file + AI check + on-chain anchor. |
+| PDF | Invisible watermark on every page + AI check (page 1) + C2PA manifest as a detached `.c2pa` sidecar + on-chain anchor (unchanged). |
 | SVG, GIF, HEIC, HEIF, AVIF, MP3, M4A, FLAC, WAV, MP4, MOV, AVI | **Credentials only**: the C2PA manifest is embedded in the file in its **original format** (no transcode) + on-chain anchor. **No watermark** (no soft binding), and the AI check is recorded as **not assessed**. |
-| PDF | C2PA manifest as a detached `.c2pa` sidecar + on-chain anchor (unchanged). |
 
 An animated WebP or APNG, and a multi-page or high-bit-depth (16-bit, float, CMYK) TIFF, is
 detected from its bytes and handled as **credentials only**, so a watermark would never
 degrade it. Camera raws built on TIFF (DNG, NEF, CR2, ARW) are refused. Per file: audio and
 video up to **100 MB**, everything else up to **200 MB**.
 
-A credentials-only file reports `watermarked: false`, `delivery: "credentials_only"`,
-`soft_binding_supported: false` (with `credentials_only_reason`) and `ai_check_assessed: false`.
-That is the expected outcome for the format, not a failure.
+A credentials-only file reports `soft_binding_supported: false` (with
+`credentials_only_reason`), `delivery: "credentials_only"` and `ai_check_assessed: false`.
+That is the expected outcome for the file, not a failure. `watermarked: false` on its own
+means nothing of the sort: it is also what a JPEG reports while it is still being processed
+(`delivery` is then null). `delivery: "watermark_missing"` is a file that was routed to get a
+watermark, completed, and has none; that is a defect to report.
 
 ## Tools
 
@@ -42,9 +45,11 @@ That is the expected outcome for the format, not a failure.
 - `protect_original` — protect an authored original; declares `CREATED_WITHOUT_AI` (override
   with `AI_ENHANCED` for AI retouching/upscaling).
 - `verify_image` — verify any supported file (hash → watermark → pHash) + C2PA validation.
-  Watermark and pHash only exist for JPEG/PNG/WebP/TIFF; a credentials-only file matches as
-  the exact file only.
-- `analyze_image` — report the AI signals an image carries, as one of three tiers (images only).
+  The watermark step exists for JPEG/PNG/WebP/TIFF and PDF; a credentials-only file matches
+  as the exact file only. A file over the limit can still be looked up by its SHA-256 with
+  `get_provenance`.
+- `analyze_image` — report the AI signals an image carries, as one of three tiers (images only,
+  up to 25 MB).
 - `get_status` — poll a `wait=false` submission.
 - `get_provenance` — look up provenance by watermark id or SHA-256.
 
@@ -131,6 +136,12 @@ Two tool arguments behave differently here than over stdio: `image_path` and `sa
 path on the *server's* disk rather than yours, so the hosted server refuses both. Send
 `image_base64` and take the result back with `return_file=true`.
 
+The hosted server also caps each file at `ONMINT_MCP_HOSTED_MAX_UPLOAD_MB` (50 MB by default,
+0 disables). A file sent there travels as base64 inside one JSON-RPC message and is held as
+that string, the decoded bytes and the upload zip at once, in a pod shared with every other
+caller. Larger files, up to the pipeline's own limit, go through a local (stdio) install with
+`image_path`, the web app, or the REST API's presigned upload.
+
 Run it yourself:
 
 ```bash
@@ -171,7 +182,10 @@ curl -o ~/.claude/skills/onmint-authenticity/SKILL.md \
   real extension; without it the type is read from the bytes, and unrecognised bytes are
   refused. The submit tools upload the file as a zip-of-one, which is what the pipeline reads.
 - Size caps (mirroring the pipeline): `MAX_AV_FILE_SIZE_MB` (100) for audio/video,
-  `MAX_FILE_SIZE_MB` (200) otherwise, `ONMINT_VERIFY_MAX_FILE_MB` (100) for `verify_image`.
+  `MAX_FILE_SIZE_MB` (200) otherwise, `ONMINT_VERIFY_MAX_FILE_MB` (100) for `verify_image`,
+  `ONMINT_ANALYZE_MAX_FILE_MB` (25) for `analyze_image`; hosted, also
+  `ONMINT_MCP_HOSTED_MAX_UPLOAD_MB` (50). These are the platform's own limits, so the web app
+  and the API refuse the same file; only the hosted cap is specific to this server.
   A credentialed file is returned inline only up to `ONMINT_MCP_MAX_INLINE_RETURN_MB` (25) and
   never for audio/video; `credentialed_file_url` is always returned.
 - Get credentials from `POST /register` on the API, then manage keys under `/keys` (or the

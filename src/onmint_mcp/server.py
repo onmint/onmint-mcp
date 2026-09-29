@@ -11,11 +11,12 @@ What a submission gets depends on the format (the tiers are decided by the pipel
 here; see SKILL.md):
   - JPEG/PNG/WebP/TIFF: invisible watermark + embedded C2PA + AI check + on-chain anchor.
     An animated WebP/APNG or a multi-page / high-bit-depth TIFF is detected from its bytes
-    and handled like the next tier instead.
+    and handled like the credentials-only tier instead.
+  - PDF: invisible watermark on every page + AI check (page 1) + a detached C2PA `.c2pa`
+    sidecar (the PDF itself carries no embedded manifest).
   - SVG, GIF, HEIC/HEIF/AVIF, MP3/M4A/FLAC/WAV, MP4/MOV/AVI: CREDENTIALS ONLY. A C2PA
     manifest embedded in the original format, no watermark (so verify matches only the exact
     file), and the AI check recorded as not assessed.
-  - PDF: detached C2PA sidecar.
 
 Design note: the AI label is DECLARED, not detected. Every submit tool sends an
 `ai_declaration` and that declaration is what gets signed into the C2PA manifest. Where the
@@ -76,19 +77,53 @@ def _reject_local_path(argument: str, value: Optional[str]) -> None:
 
 _MB = 1024 * 1024
 
+# What to do instead, per tool, when a file is over the limit. The pipeline caps mirrored in
+# settings are the platform's own, so the web app and the REST API refuse the same file: the
+# submit hint must NOT send the caller there. Only the hosted cap is specific to this server.
+_SUBMIT_TOO_LARGE = (
+    "That is the platform's per-file limit (audio/video {av:g} MB, every other file {other:g} "
+    "MB), enforced the same way by the web app and the API, so the file cannot be submitted "
+    "on any surface as it is. Nothing was submitted and nothing was charged.")
+_VERIFY_TOO_LARGE = (
+    "Nothing was uploaded. A file this large can still be looked up by its SHA-256 with "
+    "`get_provenance(sha256=...)` (GET /authenticity/provenance/by-hash/{sha256}), which "
+    "matches both the original and the credentialed file.")
+_ANALYZE_TOO_LARGE = "That is the analyze endpoint's upload limit. Nothing was uploaded."
+_HOSTED_TOO_LARGE = (
+    "That is the limit of the HOSTED MCP server only: it carries the file inline as base64 "
+    "inside one JSON-RPC message, several copies of it in a pod shared with other callers. "
+    "Nothing was uploaded or charged. Files up to the platform's own per-file limit "
+    "(audio/video {av:g} MB, every other file {other:g} MB) go through a local (stdio) install "
+    "of this MCP server with `image_path`, the web app, or the REST API directly "
+    "(POST /authenticity/attachments, then PUT to the presigned upload URLs; POST "
+    "/authenticity/verify to verify).")
 
-def _too_large(size: int, cap_mb: float, what: str) -> None:
+
+def _fmt(hint: str) -> str:
+    return hint.replace("{av:g}", f"{settings.MAX_AV_FILE_SIZE_MB:g}").replace(
+        "{other:g}", f"{settings.MAX_FILE_SIZE_MB:g}")
+
+
+def _too_large(size: int, cap_mb: float, what: str, hint: str) -> None:
     if cap_mb and size > cap_mb * _MB:
         raise ValueError(
-            f"{what} is {size / _MB:.1f} MB, over the {cap_mb:g} MB limit. Nothing was "
-            "submitted and nothing was charged. Larger files cannot go through this tool; "
-            "use the web app, or the REST API directly (POST /authenticity/attachments, then "
-            "PUT the zip to the presigned URLs), which is also where the per-file limit is "
-            "enforced.")
+            f"{what} is {size / _MB:.1f} MB, over the {cap_mb:g} MB limit. {_fmt(hint)}")
+
+
+def _cap(cap_mb: float, hint: str) -> tuple:
+    """The effective cap and its hint: the pipeline's, or the hosted server's when that is
+    lower. Hosted, a max-size call costs the base64 string, the decoded bytes and the
+    zip-of-one at once (about 670 MB for a 200 MB image), so two concurrent ones would
+    exceed the pod's 1Gi limit; the hosted cap keeps a call well inside it."""
+    hosted = settings.HOSTED_MAX_UPLOAD_MB
+    if settings.HOSTED and hosted and (not cap_mb or hosted < cap_mb):
+        return hosted, _HOSTED_TOO_LARGE
+    return cap_mb, hint
 
 
 def _load(image_path: Optional[str], image_base64: Optional[str], filename: Optional[str],
-          *, sniff: bool = True, max_mb: Optional[float] = None):
+          *, sniff: bool = True, max_mb: Optional[float] = None, too_large_hint: str = "",
+          fallback_name: Optional[str] = None):
     """Resolve file bytes from a local path or a base64 string (exactly one required).
 
     With base64 and no `filename`, the name comes from the bytes (`sniff_extension`), and a
@@ -99,23 +134,28 @@ def _load(image_path: Optional[str], image_base64: Optional[str], filename: Opti
     changed by the main pipeline's formats.
 
     `max_mb` is checked BEFORE the bytes are read or decoded (from the file's size, or from
-    the base64 length), so an oversized upload never costs a decoded copy in this process.
+    the base64 length), so an oversized upload never costs a decoded copy in this process;
+    `too_large_hint` is the tool's own advice for that case. `fallback_name` names nameless
+    bytes the sniffer does not recognise instead of refusing them (analyze_image, whose
+    endpoint also takes types the sniffer does not know).
     """
     _reject_local_path("image_path", image_path)
     if image_path:
         if max_mb:
-            _too_large(os.path.getsize(image_path), max_mb, "The file")
+            _too_large(os.path.getsize(image_path), max_mb, "The file", too_large_hint)
         with open(image_path, "rb") as f:
             return f.read(), filename or os.path.basename(image_path)
     if image_base64:
         if max_mb:
-            _too_large(len(image_base64) * 3 // 4, max_mb, "The file")
+            _too_large(len(image_base64) * 3 // 4, max_mb, "The file", too_large_hint)
         data = base64.b64decode(image_base64)
         if filename:
             return data, filename
         if not sniff:
             return data, "upload.png"
         ext = sniff_extension(data)
+        if ext is None and fallback_name:
+            return data, fallback_name
         if ext is None:
             raise ValueError(
                 "Could not tell the file type from its bytes. Pass `filename` with the real "
@@ -125,11 +165,14 @@ def _load(image_path: Optional[str], image_base64: Optional[str], filename: Opti
 
 
 def _check_pipeline_cap(data: bytes, fname: str) -> None:
-    """The main pipeline's per-file cap for this file's type: audio/video, or anything else."""
+    """The main pipeline's per-file cap for this file's type: audio/video, or anything else
+    (lowered to the hosted cap on the hosted server)."""
     if is_audio_video(_mime(fname)):
-        _too_large(len(data), settings.MAX_AV_FILE_SIZE_MB, "This audio/video file")
+        cap_mb, what = settings.MAX_AV_FILE_SIZE_MB, "This audio/video file"
     else:
-        _too_large(len(data), settings.MAX_FILE_SIZE_MB, "The file")
+        cap_mb, what = settings.MAX_FILE_SIZE_MB, "The file"
+    cap_mb, hint = _cap(cap_mb, _SUBMIT_TOO_LARGE)
+    _too_large(len(data), cap_mb, what, hint)
 
 
 # The warning tokens that mean the AI check did not examine the file. A copy of the
@@ -152,6 +195,59 @@ def _ai_check_assessed(verdict) -> Optional[bool]:
     if any(w.startswith(_NOT_ASSESSED_PREFIXES) for w in warnings):
         return False
     return (verdict.get("modules") or {}).get("ai_generated_probability") is not None
+
+
+# The types a perceptual watermark is offered for, by the mime alone: the watermark
+# service's _WATERMARKABLE_MIMES (file_service.py). Used ONLY for rows stored before the
+# per-file decision (`soft_binding_supported`) was recorded; since then an animated WebP/APNG
+# or a multi-page / high-bit-depth TIFF of one of these types goes credentials-only too, and
+# only the stored per-file outcome says so.
+_WATERMARK_EXPECTED_MIMES = frozenset({
+    "image/jpeg", "image/jpg", "image/pjpeg", "image/png", "image/webp", "image/tiff",
+    "application/pdf",
+})
+_COMPLETED = "FILEDGR_DATA_ATTACHMENT_COMPLETED"
+
+
+def _watermark_expected(file: dict, soft_binding: Optional[bool] = None) -> Optional[bool]:
+    """Whether this file was routed to get a watermark: the stored per-file decision first,
+    the mime rule for a legacy row that has none, None when neither is known."""
+    if soft_binding is None:
+        soft_binding = file.get("soft_binding_supported")
+    if soft_binding is False or file.get("credentials_only_reason"):
+        return False
+    if soft_binding is True:
+        return True
+    mime = (file.get("mimetype") or "").lower().split(";")[0].strip()
+    if not mime:
+        return None
+    return mime in _WATERMARK_EXPECTED_MIMES
+
+
+def _delivery(file: dict, status: Optional[str],
+              soft_binding: Optional[bool] = None) -> Optional[str]:
+    """What the file was delivered as, from the ROUTING decision, not from the embed result.
+
+    `watermarked` is a plain bool that defaults to False, so it is False both on a JPEG still
+    being processed and on a JPEG whose paid embed failed. Reading "no watermark" as
+    "credentials only" would present a pending file, or a defect, as the product working as
+    designed. So:
+      - "credentials_only": the file was routed to credentials only (per-file decision, or
+        the mime rule for a legacy row). The expected outcome, not a failure.
+      - "watermarked": a watermark was embedded.
+      - "watermark_missing": a watermark was expected, the submission COMPLETED, and there is
+        none. A defect worth reporting.
+      - None: not known yet (still processing), the submission failed (`status` says so),
+        or the service reported nothing to decide from.
+    """
+    if file.get("watermarked"):
+        return "watermarked"
+    expected = _watermark_expected(file, soft_binding)
+    if expected is False:
+        return "credentials_only"
+    if expected and status == _COMPLETED:
+        return "watermark_missing"
+    return None
 
 
 def _summary(attachment: dict) -> dict:
@@ -180,17 +276,18 @@ def _summary(attachment: dict) -> dict:
         "content_class": content_class,
         "mode": mode,
         "mimetype": first.get("mimetype"),
-        # Whether a perceptual watermark was actually embedded. Only JPEG/PNG/WebP/TIFF are
-        # offered one, and not every one of those (an animated WebP or APNG, or a
-        # multi-page / high-bit-depth TIFF, goes credentials-only, decided per file at
-        # ingest). `soft_binding_supported` False and `credentials_only_reason` say it was
-        # never expected; None on either means the service did not report it.
+        # Whether a perceptual watermark was actually embedded. False until the embed has
+        # come back, so on its own it cannot tell a pending or failed embed from a file that
+        # never gets one; `delivery` below makes that distinction. JPEG/PNG/WebP/TIFF and
+        # PDF are offered a watermark, and not every one of those (an animated WebP or APNG,
+        # or a multi-page / high-bit-depth TIFF, goes credentials-only, decided per file at
+        # ingest). `soft_binding_supported` False (with `credentials_only_reason`) says it was
+        # never expected; None means a row stored before that was recorded.
         "watermarked": first.get("watermarked"),
         "watermark_algo": first.get("watermark_algo"),
         "soft_binding_supported": first.get("soft_binding_supported"),
         "credentials_only_reason": first.get("credentials_only_reason"),
-        "delivery": (None if first.get("watermarked") is None
-                     else "watermarked" if first.get("watermarked") else "credentials_only"),
+        "delivery": _delivery(first, attachment.get("status")),
         # False for every credentials-only file (no detector for the type) and whenever
         # the check declined; the declaration above is then the only AI statement.
         "ai_check_assessed": _ai_check_assessed(first.get("vetting_verdict")),
@@ -217,10 +314,13 @@ async def _submit(stream_id, image_path, image_base64, filename, name, title, ca
                   ai_declaration, wait, return_file=False, save_to=None,
                   visible_ai_label=False, allow_ai_training_and_mining=False,
                   label_template=None) -> dict:
-    # The larger of the two pipeline caps before decoding; the exact per-type cap after,
-    # once the name (possibly sniffed) says which type this is.
-    data, fname = _load(image_path, image_base64, filename,
-                        max_mb=max(settings.MAX_FILE_SIZE_MB, settings.MAX_AV_FILE_SIZE_MB))
+    # The larger of the two pipeline caps before decoding (the hosted cap when that is
+    # lower); the exact per-type cap after, once the name (possibly sniffed) says which type
+    # this is.
+    cap_mb, hint = _cap(max(settings.MAX_FILE_SIZE_MB, settings.MAX_AV_FILE_SIZE_MB),
+                        _SUBMIT_TOO_LARGE)
+    data, fname = _load(image_path, image_base64, filename, max_mb=cap_mb,
+                        too_large_hint=hint)
     _check_pipeline_cap(data, fname)
     _reject_local_path("save_to", save_to)
     client = _client()
@@ -233,9 +333,10 @@ async def _submit(stream_id, image_path, image_base64, filename, name, title, ca
         title=title, category=category, wait=wait, label_template=label_template,
     )
     result = _summary(attachment)
+    first_file = (attachment.get("files") or [None])[0]
     wmid = result.get("watermark_id")
     # Enrich with the public provenance ("nutrition label") + canonical URLs, and — when
-    # requested — the credentialed (C2PA-signed, and for JPEG/PNG/WebP/TIFF also
+    # requested — the credentialed (C2PA-signed, and for JPEG/PNG/WebP/TIFF and PDF also
     # watermarked) file fetched from IPFS.
     if wmid:
         try:
@@ -245,6 +346,10 @@ async def _submit(stream_id, image_path, image_base64, filename, name, title, ca
             result["verify_url"] = f"{settings.PUBLIC_APP_URL}/prove/{wmid}"
             if "soft_binding_supported" in prov:
                 result["soft_binding_supported"] = prov["soft_binding_supported"]
+                # A legacy file row carries no per-file decision; the provenance does.
+                if first_file is not None and first_file.get("soft_binding_supported") is None:
+                    result["delivery"] = _delivery(first_file, attachment.get("status"),
+                                                   prov["soft_binding_supported"])
             if (return_file or save_to):
                 await _attach_credentialed_file(client, result, prov, fname, data_len=len(data),
                                                 return_file=return_file, save_to=save_to)
@@ -328,12 +433,15 @@ async def submit_content(ai_declaration: str,
     extension; without it the type is read from the bytes, and unrecognised bytes are
     refused. Per file: audio/video up to 100 MB, everything else up to 200 MB.
       - JPEG, PNG, WebP, TIFF: invisible watermark + embedded C2PA + AI check.
+      - PDF: invisible watermark on every page + AI check (page 1) + a detached C2PA
+        `.c2pa` sidecar.
       - SVG, GIF, HEIC, HEIF, AVIF, MP3, M4A, FLAC, WAV, MP4, MOV, AVI (and an animated
         WebP/APNG or a multi-page / high-bit-depth TIFF): credentials only. The C2PA
         manifest is embedded in the original format, NO watermark is embedded
-        (`watermarked=false`, `delivery="credentials_only"`), and the AI check is recorded
-        as not assessed (`ai_check_assessed=false`).
-      - PDF: detached C2PA sidecar.
+        (`soft_binding_supported=false`, `delivery="credentials_only"`), and the AI check
+        is recorded as not assessed (`ai_check_assessed=false`).
+    `delivery="watermark_missing"` means a watermark was expected and is not there: a
+    defect to report, not the credentials-only outcome.
 
     `ai_declaration` is REQUIRED and has no default — it is the authoritative AI label and it
     is signed into the credentials, so ASK THE USER rather than inferring it from the file.
@@ -345,7 +453,8 @@ async def submit_content(ai_declaration: str,
     `allow_ai_training_and_mining` (default false = refuse) writes the standard
     c2pa.training-mining assertion.
 
-    For JPEG/PNG/WebP/TIFF an AI detector runs and is reported alongside the declaration as a
+    For JPEG/PNG/WebP/TIFF and PDF an AI detector runs and is reported alongside the
+    declaration as a
     secondary automated assessment; it never overrides what was declared. `stream_id` is
     optional — if omitted, a stream is reused/provisioned automatically. Set `return_file` (or
     `save_to`) to get the credentialed file back: `credentialed_file_url` always, and the
@@ -388,12 +497,15 @@ async def label_ai_output(image_path: Optional[str] = None,
     extension; without it the type is read from the bytes, and unrecognised bytes are
     refused. Per file: audio/video up to 100 MB, everything else up to 200 MB.
       - JPEG, PNG, WebP, TIFF: invisible watermark + embedded C2PA + AI check.
+      - PDF: invisible watermark on every page + AI check (page 1) + a detached C2PA
+        `.c2pa` sidecar.
       - SVG, GIF, HEIC, HEIF, AVIF, MP3, M4A, FLAC, WAV, MP4, MOV, AVI (and an animated
         WebP/APNG or a multi-page / high-bit-depth TIFF): credentials only. The C2PA
         manifest is embedded in the original format, NO watermark is embedded
-        (`watermarked=false`, `delivery="credentials_only"`), and the AI check is recorded
-        as not assessed (`ai_check_assessed=false`).
-      - PDF: detached C2PA sidecar.
+        (`soft_binding_supported=false`, `delivery="credentials_only"`), and the AI check
+        is recorded as not assessed (`ai_check_assessed=false`).
+    `delivery="watermark_missing"` means a watermark was expected and is not there: a
+    defect to report, not the credentials-only outcome.
 
     Declares AI_GENERATED by default — that is what this tool is for, exactly as it used to
     hardcode declared_ai=true. Override `ai_declaration` with AI_MODIFIED if AI changed an
@@ -401,7 +513,7 @@ async def label_ai_output(image_path: Optional[str] = None,
     appropriate here and `protect_original` is the tool for them.
 
     The declaration is signed into the C2PA manifest as an IPTC digitalSourceType, for every
-    format, and is also encoded in the watermark for JPEG/PNG/WebP/TIFF. For the
+    format, and is also encoded in the watermark for JPEG/PNG/WebP/TIFF and PDF. For the
     credentials-only formats the signed manifest is the only carrier. Set
     `visible_ai_label=true` to also burn the visible label into the pixels (JPEG/PNG/WebP/TIFF
     only). `stream_id` is optional (auto-provisioned). By default returns the labeled file
@@ -445,12 +557,15 @@ async def protect_original(image_path: Optional[str] = None,
     extension; without it the type is read from the bytes, and unrecognised bytes are
     refused. Per file: audio/video up to 100 MB, everything else up to 200 MB.
       - JPEG, PNG, WebP, TIFF: invisible watermark + embedded C2PA + AI check.
+      - PDF: invisible watermark on every page + AI check (page 1) + a detached C2PA
+        `.c2pa` sidecar.
       - SVG, GIF, HEIC, HEIF, AVIF, MP3, M4A, FLAC, WAV, MP4, MOV, AVI (and an animated
         WebP/APNG or a multi-page / high-bit-depth TIFF): credentials only. The C2PA
         manifest is embedded in the original format, NO watermark is embedded
-        (`watermarked=false`, `delivery="credentials_only"`), and the AI check is recorded
-        as not assessed (`ai_check_assessed=false`).
-      - PDF: detached C2PA sidecar.
+        (`soft_binding_supported=false`, `delivery="credentials_only"`), and the AI check
+        is recorded as not assessed (`ai_check_assessed=false`).
+    `delivery="watermark_missing"` means a watermark was expected and is not there: a
+    defect to report, not the credentials-only outcome.
 
     Declares CREATED_WITHOUT_AI by default — that is what this tool is for, exactly as it used
     to hardcode declared_ai=false. Override with AI_ENHANCED if the asset was retouched,
@@ -458,7 +573,7 @@ async def protect_original(image_path: Optional[str] = None,
     protected rather than labelled, but the declaration should say so. Only use this tool if
     the user has confirmed it; do not assume a file is AI-free because it looks like a photo.
 
-    For JPEG/PNG/WebP/TIFF our detector runs and is reported as a secondary automated
+    For JPEG/PNG/WebP/TIFF and PDF our detector runs and is reported as a secondary automated
     assessment. It does NOT override the declaration — if it disagrees, both readings are
     published and the disagreement is visible, which is the information a reviewer needs.
     The credentials-only formats have no detector; the declaration stands alone.
@@ -486,14 +601,17 @@ async def verify_image(image_path: Optional[str] = None,
                        filename: Optional[str] = None) -> dict:
     """Verify ANY supported file (image, audio, video or PDF, up to 100 MB), even one never
     uploaded to us. Cascades exact-hash -> watermark decode -> pHash similarity and validates
-    the C2PA manifest. The watermark and pHash steps only exist for JPEG/PNG/WebP/TIFF; a
-    credentials-only file (SVG, GIF, HEIC/HEIF/AVIF, audio, video; `soft_binding_supported`
-    false) matches only as the exact file, by either its original or its credentialed hash,
-    or by its embedded manifest. `match_method=none` means the file is unknown to on:mint.
-    Returns match method, confidence, provenance, and C2PA state. With `image_base64`, pass
-    `filename` with the real extension."""
-    data, fname = _load(image_path, image_base64, filename,
-                        max_mb=settings.VERIFY_MAX_FILE_MB)
+    the C2PA manifest. The watermark step only exists for the watermarked formats (JPEG, PNG,
+    WebP, TIFF, PDF) and pHash for the images among them; a credentials-only file (SVG, GIF,
+    HEIC/HEIF/AVIF, audio, video; `soft_binding_supported` false) matches only as the exact
+    file, by either its original or its credentialed hash, or by its embedded manifest.
+    `match_method=none` means the file is unknown to on:mint. Returns match method,
+    confidence, provenance, and C2PA state. With `image_base64`, pass `filename` with the
+    real extension. A file over the limit can still be looked up by its SHA-256 with
+    `get_provenance`."""
+    cap_mb, hint = _cap(settings.VERIFY_MAX_FILE_MB, _VERIFY_TOO_LARGE)
+    data, fname = _load(image_path, image_base64, filename, max_mb=cap_mb,
+                        too_large_hint=hint)
     return await _client().verify(file_bytes=data, filename=fname)
 
 
@@ -503,15 +621,20 @@ async def analyze_image(image_path: Optional[str] = None,
                         filename: Optional[str] = None) -> dict:
     """Report the AI signals an image carries: `ai_signal_assessment` gives one of three tiers
     (no / isolated / clear AI signals detected), plus the per-signal breakdown (faces, NSFW,
-    EXIF/ELA manipulation). Images only (JPEG/PNG/WebP/TIFF are the ones the detector
-    assesses); there is no AI analysis for audio, video or SVG.
+    EXIF/ELA manipulation). Images only (JPEG/PNG/WebP/TIFF/BMP are the ones the detector
+    assesses), up to 25 MB; there is no AI analysis for audio, video or SVG.
 
     The old `ai_content_share` percentage has been REMOVED — it was read as "this share of the
     image is AI", which is not what the detector measures. The raw score is still available
     under `ai_signal_assessment.score` and `ai_generated_probability` for a technical view.
     Present all of it as an automated assessment, never as a verdict about the asset: the
     asset's AI label is its rights holder's declaration, not a detector's opinion."""
-    data, fname = _load(image_path, image_base64, filename)
+    # Nameless bytes the sniffer does not know (a BMP, say) keep the old `upload.png` name
+    # rather than being refused: the analyze endpoint reads the image itself and accepts
+    # types the submit pipeline does not.
+    cap_mb, hint = _cap(settings.ANALYZE_MAX_FILE_MB, _ANALYZE_TOO_LARGE)
+    data, fname = _load(image_path, image_base64, filename, max_mb=cap_mb,
+                        too_large_hint=hint, fallback_name="upload.png")
     return await _client().analyze(file_bytes=data, filename=fname)
 
 
@@ -520,7 +643,9 @@ async def get_status(attachment_id: str) -> dict:
     """Fetch the current status of a submission by attachment id (for wait=false submissions).
     Once finished, per-file provenance is populated: watermark_id, content_class, and whether
     a watermark was actually embedded (`watermarked`, `delivery`) and the AI check ran
-    (`ai_check_assessed`); credentials-only formats report false for both."""
+    (`ai_check_assessed`). A credentials-only file says so up front
+    (`soft_binding_supported=false`, `delivery="credentials_only"`); for a file that gets a
+    watermark, `delivery` stays null until the submission completes."""
     return _summary(await _client().get_status(attachment_id))
 
 

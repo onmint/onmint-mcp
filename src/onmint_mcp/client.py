@@ -30,7 +30,10 @@ _PART_SIZE = 30 * 1024 * 1024  # 30 MB — matches the backend multipart thresho
 # so this list can only ever be a nicer error, never a second source of truth.
 AI_DECLARATIONS = ("CREATED_WITHOUT_AI", "AI_ENHANCED", "AI_MODIFIED", "AI_GENERATED")
 _PRESIGN_READY = {"FILEDGR_RECEIVED", "FILEDGR_REVIEWED"}
-_TERMINAL = {"FILEDGR_DATA_ATTACHMENT_COMPLETED", "ERROR"}
+# FAILED is where every genuine pipeline failure lands (and the only status refunded); ERROR
+# is kept for the one legacy site that still writes it. Without FAILED here a failed
+# submission was polled until POLL_TIMEOUT_SECONDS and reported as a timeout.
+_TERMINAL = {"FILEDGR_DATA_ATTACHMENT_COMPLETED", "FAILED", "ERROR"}
 
 
 class OnmintApiError(RuntimeError):
@@ -547,10 +550,23 @@ def sniff_extension(data: bytes) -> Optional[str]:
         return ".mov"
     if head.startswith(b"ID3"):
         return ".mp3"
-    # An MPEG audio frame sync with a real layer (bits 1-2 of the second byte non-zero):
-    # ADTS AAC shares the 11-bit sync but has layer 00, and JPEG was matched above.
-    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0 and (head[1] & 0x06):
+    # An MPEG audio frame header: the 11-bit sync, a real layer (bits 1-2 of the second byte
+    # non-zero; ADTS AAC shares the sync but has layer 00, and JPEG was matched above), a
+    # defined version (not the reserved 01), not FF FE / FF FF (the UTF-16LE BOM, and fill
+    # bytes: both are technically MPEG-1 Layer I, which nobody ships, and a UTF-16 SVG or
+    # XML must not become upload.mp3), and a third byte whose bitrate index is not 1111 and
+    # sample-rate index is not 11, the "bad" values no real frame carries.
+    if (len(head) >= 3 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0 and (head[1] & 0x06)
+            and head[1] not in (0xFE, 0xFF) and (head[1] & 0x18) != 0x08
+            and (head[2] >> 4) != 0xF and ((head[2] >> 2) & 3) != 3):
         return ".mp3"
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        # A UTF-16 text file. An SVG saved that way is named .svg, so the ingest's own SVG
+        # check decides whether it takes that encoding and says so, instead of an mp3 guess.
+        try:
+            head = head[:len(head) & ~1].decode("utf-16").encode("utf-8", "ignore")
+        except UnicodeDecodeError:
+            return None
     text = head.removeprefix(b"\xef\xbb\xbf").lstrip().lower()
     if text.startswith((b"<svg", b"<?xml", b"<!--", b"<!doctype svg")) and b"<svg" in text:
         return ".svg"

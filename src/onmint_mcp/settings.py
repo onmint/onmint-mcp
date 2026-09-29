@@ -16,8 +16,8 @@ POLL_INTERVAL_SECONDS = float(os.environ.get("ONMINT_POLL_INTERVAL_SECONDS", "5"
 POLL_TIMEOUT_SECONDS = float(os.environ.get("ONMINT_POLL_TIMEOUT_SECONDS", "1800"))
 
 # Public IPFS gateway used to fetch the credentialed file back (the C2PA-signed file, which
-# is also watermarked only for JPEG/PNG/WebP/TIFF), and the public app base for share/verify
-# URLs.
+# is also watermarked for JPEG/PNG/WebP/TIFF and PDF, the PDF with a detached sidecar), and
+# the public app base for share/verify URLs.
 IPFS_GATEWAY = os.environ.get("ONMINT_IPFS_GATEWAY", "https://ipfs.pub.dev-onmint.com").rstrip("/")
 # Defaults to the DEV app. NOT `app.dev-onmint.com`: that legacy host is still live but is
 # served the PRODUCTION bundle by the shared webapp load balancer, so it points at the prod
@@ -45,8 +45,17 @@ HOSTED = TRANSPORT != "stdio"
 # credentials-only path still holds each file whole in memory in several services.
 MAX_FILE_SIZE_MB = float(os.environ.get("MAX_FILE_SIZE_MB", "200"))
 MAX_AV_FILE_SIZE_MB = float(os.environ.get("MAX_AV_FILE_SIZE_MB", "100"))
-# The verify-by-file upload cap of the API (/authenticity/verify).
+# The verify-by-file upload cap of the API (/authenticity/verify, VERIFY_MAX_UPLOAD_MB).
 VERIFY_MAX_FILE_MB = float(os.environ.get("ONMINT_VERIFY_MAX_FILE_MB", "100"))
+# The analyze upload cap of the API (/authenticity/analyze, appcontroller-api MAX_UPLOAD_MB).
+ANALYZE_MAX_FILE_MB = float(os.environ.get("ONMINT_ANALYZE_MAX_FILE_MB", "25"))
+# The HOSTED server's own per-file cap, below the pipeline's. Hosted, a file arrives as base64
+# inside one JSON-RPC message and is held as that string, the decoded bytes and the
+# zip-of-one at once: about 670 MB for a 200 MB image, so two concurrent max-size calls would
+# exceed the pod's 1Gi memory limit. Larger files go through a local (stdio) install, the web
+# app or the REST API's presigned upload, all of which take the pipeline's full limit. Not
+# applied over stdio, where the process and its memory belong to the one caller. 0 disables.
+HOSTED_MAX_UPLOAD_MB = float(os.environ.get("ONMINT_MCP_HOSTED_MAX_UPLOAD_MB", "50"))
 # The largest file whose credentialed copy is returned INLINE as base64 (`return_file`). A
 # base64 copy is a third copy of the file in this process on top of the upload and the IPFS
 # fetch, all inside one JSON-RPC response; above this, and for every audio or video file,

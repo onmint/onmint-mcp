@@ -5,7 +5,7 @@ description: >-
   audio, video or PDF), and verify the authenticity of any such file or the AI content of
   an image, via the on:mint authenticity API. Use when a task involves proving a file is an
   authored original, labeling AI-generated output as synthetic (signed C2PA credentials +
-  on-chain anchor, plus an invisible watermark on JPEG/PNG/WebP/TIFF), or checking whether
+  on-chain anchor, plus an invisible watermark on JPEG/PNG/WebP/TIFF/PDF), or checking whether
   an image is AI-generated / manipulated.
 ---
 
@@ -34,17 +34,20 @@ watermark for the formats that take one:
 | Format | What a submission gets |
 |---|---|
 | JPEG, PNG, WebP, TIFF | **Full pipeline**: invisible watermark + C2PA Content Credentials embedded in the file + AI check + on-chain anchor. |
+| PDF | Invisible watermark on every page + AI check (page 1) + C2PA manifest as a detached `.c2pa` sidecar + on-chain anchor (unchanged). |
 | SVG, GIF, HEIC, HEIF, AVIF, MP3, M4A, FLAC, WAV, MP4, MOV, AVI | **Credentials only**: the C2PA manifest is embedded in the file in its **original format** (no transcode) + on-chain anchor. **No watermark** (no soft binding), and the AI check is recorded as **not assessed**. |
-| PDF | C2PA manifest as a detached `.c2pa` sidecar + on-chain anchor (unchanged). |
 
 An animated WebP or APNG, and a multi-page or high-bit-depth (16-bit, float, CMYK) TIFF, is
 detected from its bytes and handled as **credentials only**, so a watermark would never
 degrade it. Camera raws built on TIFF (DNG, NEF, CR2, ARW) are refused. Per file: audio and
 video up to **100 MB**, everything else up to **200 MB**.
 
-A credentials-only file reports `watermarked: false`, `delivery: "credentials_only"`,
-`soft_binding_supported: false` (with `credentials_only_reason`) and `ai_check_assessed: false`.
-That is the expected outcome for the format, not a failure.
+A credentials-only file reports `soft_binding_supported: false` (with
+`credentials_only_reason`), `delivery: "credentials_only"` and `ai_check_assessed: false`.
+That is the expected outcome for the file, not a failure. `watermarked: false` on its own
+means nothing of the sort: it is also what a JPEG reports while it is still being processed
+(`delivery` is then null). `delivery: "watermark_missing"` is a file that was routed to get a
+watermark, completed, and has none; that is a defect to report.
 
 Where the format has an AI check, the detector no longer decides anything. Its reading is
 returned as a secondary *automated assessment* in one of three tiers (no / isolated / clear AI
@@ -102,10 +105,11 @@ Get credentials from `POST /register`, then manage additional scoped keys under 
   and the server reuses an existing stream or provisions a template → vault → stream. Set
   `ONMINT_DEFAULT_STREAM_ID` to pin one and skip provisioning (recommended for repeated use;
   API vault creation can be slow to settle in some environments).
-- **Only JPEG/PNG/WebP/TIFF get an invisible watermark and an AI check.** SVG, GIF,
+- **Only JPEG/PNG/WebP/TIFF and PDF get an invisible watermark and an AI check** (a PDF on
+  every page, checked on page 1, with its manifest as a detached sidecar). SVG, GIF,
   HEIC/HEIF/AVIF, audio and video get an embedded C2PA manifest in their original format and
-  nothing else: no watermark, AI check not assessed. PDF gets a detached sidecar. See the
-  table above. Never promise a watermark or a detector reading for a credentials-only file.
+  nothing else: no watermark, AI check not assessed. See the table above. Never promise a
+  watermark or a detector reading for a credentials-only file.
 - **The submit tools take any supported file** through `image_path` / `image_base64` (the
   names are kept for compatibility). With `image_base64`, pass `filename` with the real
   extension; without one the type is read from the bytes, and bytes it cannot identify are
@@ -113,8 +117,14 @@ Get credentials from `POST /register`, then manage additional scoped keys under 
 - **`verify_image` works on any supported file** (up to 100 MB) — no prior submission needed.
   A credentials-only file matches only as the exact file (by its original or its credentialed
   hash, or its embedded manifest): there is no watermark to recover from a re-encoded or
-  cropped copy. A `match_method` of `none` means the file is unknown to on:mint.
-- **`analyze_image` is for images.** There is no AI analysis for audio, video or SVG.
+  cropped copy. A `match_method` of `none` means the file is unknown to on:mint. A file over
+  the limit can still be looked up by its SHA-256 with `get_provenance`.
+- **Size limits are the platform's own** (audio/video 100 MB, everything else 200 MB), so
+  the web app and the API refuse the same file; do not suggest retrying there. The hosted
+  server alone takes less (50 MB by default): above that, a local install with `image_path`,
+  the web app or the REST API take the file up to the platform limit.
+- **`analyze_image` is for images** (up to 25 MB). There is no AI analysis for audio, video or
+  SVG.
 - AI-generation probability is a **calibrated estimate**, not ground truth — present it as a
   probability, never as proof.
 

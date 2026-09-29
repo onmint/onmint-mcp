@@ -103,11 +103,15 @@ def make_transport(state):
                     "id": "att1", "status": "FILEDGR_RECEIVED",
                     "presigned_urls": [{"part": 1, "link": "https://s3.test/put"}]})
             return httpx.Response(200, json={
-                "id": "att1", "status": "FILEDGR_DATA_ATTACHMENT_COMPLETED",
+                "id": "att1",
+                "status": state.get("final_status", "FILEDGR_DATA_ATTACHMENT_COMPLETED"),
                 "ai_disclosure": {"declaration": "CREATED_WITHOUT_AI"},
                 "files": [state["file"]]})
         if path == "/v1/authenticity/provenance/WMK-1":
             return httpx.Response(200, json=state["prov"])
+        if path == "/v1/authenticity/analyze" and method == "POST":
+            state["analyze_body"] = request.content
+            return httpx.Response(200, json={"ai_signal_assessment": {"tier": "none"}})
         if path == "/v1/authenticity/verify" and method == "POST":
             state["verify_body"] = request.content
             return httpx.Response(200, json={"match_method": "hash"})
@@ -196,7 +200,8 @@ def test_an_embedded_image_comes_back_inline_from_the_manifest_cid(monkeypatch):
 
 
 def test_a_pdf_comes_back_from_inside_the_wrapped_directory(monkeypatch):
-    file = dict(VIDEO_FILE, mimetype="application/pdf", c2pa_embedded=False)
+    file = dict(VIDEO_FILE, mimetype="application/pdf", c2pa_embedded=False, watermarked=True,
+                soft_binding_supported=True, credentials_only_reason=None)
     prov = dict(VIDEO_PROV, mime="application/pdf", filename="my doc.pdf", c2pa_embedded=None,
                 c2pa_manifest_cid="cidSidecar")
     state = {"file": file, "prov": prov}
@@ -207,6 +212,8 @@ def test_a_pdf_comes_back_from_inside_the_wrapped_directory(monkeypatch):
     assert state["ipfs_paths"] == ["/ipfs/cidDir/my doc.pdf"]
     assert result["credentialed_file_name"] == "my doc.pdf"
     assert result["c2pa_sidecar_url"].endswith("/ipfs/cidSidecar")
+    # A PDF is watermarked (every page); it is not a credentials-only file.
+    assert result["delivery"] == "watermarked"
 
 
 def test_audio_and_video_are_capped_lower_than_everything_else(monkeypatch):
@@ -247,3 +254,163 @@ def test_mintys_keeps_its_old_default_name(monkeypatch):
     (mintys sniffs the bytes itself), even when the bytes are something else."""
     data, name = server._load(None, base64.b64encode(MP4).decode(), None, sniff=False)
     assert name == "upload.png" and data == MP4
+
+
+# ------------------------------------------------------------------ delivery
+JPEG_ROW = {"watermark_id": "WMK-1", "mimetype": "image/jpeg", "watermarked": False,
+            "soft_binding_supported": True, "credentials_only_reason": None}
+
+
+def _att(file, status):
+    return {"id": "att1", "status": status, "files": [file]}
+
+
+@pytest.mark.parametrize("status", ["FILEDGR_RECEIVED", "FILEDGR_EMBEDDING", "FILEDGR_UPLOADED",
+                                    "FAILED"])
+def test_a_jpeg_without_its_watermark_yet_is_not_called_credentials_only(status):
+    """`watermarked` is False until the embed comes back (and on a failed submission); that
+    is not the credentials-only outcome."""
+    assert server._summary(_att(JPEG_ROW, status))["delivery"] is None
+
+
+def test_a_completed_jpeg_without_a_watermark_is_reported_as_missing():
+    result = server._summary(_att(JPEG_ROW, "FILEDGR_DATA_ATTACHMENT_COMPLETED"))
+    assert result["delivery"] == "watermark_missing"
+    assert result["soft_binding_supported"] is True
+
+
+def test_the_per_file_decision_routes_an_animated_webp_to_credentials_only():
+    row = dict(JPEG_ROW, mimetype="image/webp", soft_binding_supported=False,
+               credentials_only_reason="animated")
+    assert server._summary(_att(row, "FILEDGR_EMBEDDING"))["delivery"] == "credentials_only"
+    # The reason alone is enough, too.
+    row = dict(row, soft_binding_supported=None)
+    assert server._summary(_att(row, "FILEDGR_EMBEDDING"))["delivery"] == "credentials_only"
+
+
+@pytest.mark.parametrize("mime,status,delivery", [
+    ("video/mp4", "FILEDGR_EMBEDDING", "credentials_only"),
+    ("image/svg+xml", "FILEDGR_DATA_ATTACHMENT_COMPLETED", "credentials_only"),
+    ("image/jpeg", "FILEDGR_EMBEDDING", None),
+    ("image/jpeg", "FILEDGR_DATA_ATTACHMENT_COMPLETED", "watermark_missing"),
+    ("application/pdf", "FILEDGR_DATA_ATTACHMENT_COMPLETED", "watermark_missing"),
+    (None, "FILEDGR_DATA_ATTACHMENT_COMPLETED", None),
+])
+def test_a_legacy_row_falls_back_to_the_mime_rule(mime, status, delivery):
+    row = dict(JPEG_ROW, mimetype=mime, soft_binding_supported=None)
+    assert server._summary(_att(row, status))["delivery"] == delivery
+
+
+def test_a_legacy_row_takes_the_decision_from_the_provenance(monkeypatch):
+    """A file row stored before the per-file decision: the provenance's value decides."""
+    file = dict(VIDEO_FILE, mimetype="image/webp", soft_binding_supported=None,
+                credentials_only_reason=None)
+    state = {"file": file, "prov": dict(VIDEO_PROV, mime="image/webp")}
+    _wire(monkeypatch, state)
+    result = asyncio.run(server.protect_original(
+        image_base64=base64.b64encode(WEBP).decode(), filename="a.webp", stream_id="s1"))
+    assert result["soft_binding_supported"] is False
+    assert result["delivery"] == "credentials_only"
+
+
+def test_get_status_on_a_jpeg_still_processing(monkeypatch):
+    state = {"uploaded": b"x", "final_status": "FILEDGR_EMBEDDING", "file": JPEG_ROW}
+    _wire(monkeypatch, state)
+    result = asyncio.run(server.get_status("att1"))
+    assert result["watermarked"] is False
+    assert result["delivery"] is None
+
+
+def test_a_failed_submission_stops_the_wait(monkeypatch):
+    """FAILED is terminal: waiting on it returns at once instead of timing out."""
+    monkeypatch.setattr(settings, "POLL_TIMEOUT_SECONDS", 0.05)
+    state = {"final_status": "FAILED", "file": JPEG_ROW, "prov": {}}
+    _wire(monkeypatch, state)
+    result = asyncio.run(server.protect_original(
+        image_base64=base64.b64encode(JPEG).decode(), filename="a.jpg", stream_id="s1"))
+    assert result["status"] == "FAILED"
+    assert result["delivery"] is None
+
+
+# ------------------------------------------------------------------ size limits
+def test_the_submit_limit_does_not_send_the_caller_to_another_surface(monkeypatch):
+    monkeypatch.setattr(settings, "MAX_FILE_SIZE_MB", 0.001)
+    monkeypatch.setattr(settings, "MAX_AV_FILE_SIZE_MB", 0.001)
+    with pytest.raises(ValueError) as err:
+        asyncio.run(server.protect_original(image_base64="A" * 8192, stream_id="s1"))
+    message = str(err.value)
+    assert "on any surface" in message and "nothing was charged" in message
+    # The web app and the API enforce the same limits: no "use them instead" advice.
+    assert "use the web app" not in message and "presigned" not in message
+
+
+def test_the_verify_limit_points_at_the_hash_lookup(monkeypatch):
+    monkeypatch.setattr(settings, "VERIFY_MAX_FILE_MB", 0.001)
+    state = {}
+    _wire(monkeypatch, state)
+    with pytest.raises(ValueError) as err:
+        asyncio.run(server.verify_image(image_base64="A" * 8192))
+    message = str(err.value)
+    assert "get_provenance" in message and "by-hash" in message
+    assert "submitted" not in message and "charged" not in message
+    assert "verify_body" not in state
+
+
+def test_analyze_refuses_an_oversized_base64_before_any_request(monkeypatch):
+    monkeypatch.setattr(settings, "ANALYZE_MAX_FILE_MB", 0.001)
+    state = {}
+    _wire(monkeypatch, state)
+    # Not valid base64: refused on its length, never decoded.
+    with pytest.raises(ValueError, match="over the"):
+        asyncio.run(server.analyze_image(image_base64="!" * 8192))
+    assert "analyze_body" not in state
+
+
+def test_analyze_still_takes_a_nameless_bmp(monkeypatch):
+    """The analyze endpoint reads BMP; bytes the sniffer does not know keep the old name."""
+    state = {}
+    _wire(monkeypatch, state)
+    bmp = b"BM" + (70).to_bytes(4, "little") + b"\x00" * 64
+    asyncio.run(server.analyze_image(image_base64=base64.b64encode(bmp).decode()))
+    assert b'filename="upload.png"' in state["analyze_body"]
+
+
+def test_the_hosted_server_caps_uploads_below_the_pipeline(monkeypatch):
+    monkeypatch.setattr(settings, "HOSTED", True)
+    monkeypatch.setattr(settings, "HOSTED_MAX_UPLOAD_MB", 0.001)
+    state = {}
+    _wire(monkeypatch, state)
+    with pytest.raises(ValueError) as err:
+        asyncio.run(server.protect_original(
+            image_base64=base64.b64encode(PNG + b"\x00" * 4096).decode(), filename="a.png",
+            stream_id="s1"))
+    assert "HOSTED" in str(err.value) and "presigned" in str(err.value)
+    with pytest.raises(ValueError, match="HOSTED"):
+        asyncio.run(server.verify_image(
+            image_base64=base64.b64encode(PNG + b"\x00" * 4096).decode(), filename="a.png"))
+    assert "create_body" not in state and "verify_body" not in state
+    # Over stdio the same file is under the pipeline cap and goes through.
+    monkeypatch.setattr(settings, "HOSTED", False)
+    state.update(file=dict(VIDEO_FILE, mimetype="image/png"), prov=dict(VIDEO_PROV))
+    asyncio.run(server.protect_original(
+        image_base64=base64.b64encode(PNG + b"\x00" * 4096).decode(), filename="a.png",
+        stream_id="s1"))
+    assert state["create_body"]["filename"] == "a.png"
+
+
+# ------------------------------------------------------------------ sniffing edge cases
+@pytest.mark.parametrize("data", [
+    b"\xff\xfe<\x00s\x00v\x00g\x00",   # UTF-16LE text
+    b"\xff\xff\xff\xff" + b"\x00" * 16,  # fill bytes
+    b"\xff\xfb\xf0\x00" + b"\x00" * 16,  # bitrate index 1111
+    b"\xff\xfb\x9c\x00" + b"\x00" * 16,  # sample-rate index 11
+    b"\xff\xeb\x90\x64" + b"\x00" * 16,  # reserved MPEG version 01
+])
+def test_not_an_mpeg_frame(data):
+    assert sniff_extension(data) != ".mp3"
+
+
+def test_a_utf16_svg_is_an_svg():
+    svg = "<svg xmlns='http://www.w3.org/2000/svg'/>"
+    assert sniff_extension(b"\xff\xfe" + svg.encode("utf-16-le")) == ".svg"
+    assert sniff_extension(b"\xfe\xff" + svg.encode("utf-16-be")) == ".svg"
