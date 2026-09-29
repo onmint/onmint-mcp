@@ -2,7 +2,8 @@
 Async HTTP client for the on:mint authenticity API (onmint-appcontroller-api /authenticity).
 
 Encapsulates the full developer flow so the MCP tools stay thin:
-  - submit_and_wait: create -> fetch presigned URL(s) -> upload (single/multipart) -> poll
+  - submit_and_wait: create -> fetch presigned URL(s) -> upload (single/multipart) -> poll.
+    The upload is a zip-of-one (see `zip_of_one`), which is what the ingest expects.
   - verify / analyze: multipart forwards
   - get_status / get_provenance: reads
 
@@ -10,7 +11,10 @@ All requests carry the API-key headers. The optional `transport` argument lets t
 an httpx.MockTransport so the flow can be exercised without a live backend.
 """
 import asyncio
+import io
 import mimetypes
+import os
+import zipfile
 from typing import Any, Optional
 
 import httpx
@@ -134,12 +138,23 @@ class OnmintClient:
         if non_ai_medium is not None:
             disclosure["non_ai_medium"] = non_ai_medium
 
+        # What goes up is a zip-of-one, never the raw file. The watermark ingest opens the
+        # uploaded object with ZipFile unconditionally, so a raw MP4 or JPEG PUT to the
+        # presigned URL failed as `internal_error exc=BadZipFile` and was refunded: no MCP
+        # submission could ever be minted. This is the same shape the webapp sends
+        # (createZipFromFiles with one entry, upload_as_zip=false): the ENTRY name is what
+        # the ingest resolves the type from, so it has to carry the real extension, and the
+        # create-body `filename` stays the media's own name, not the zip's.
+        payload = zip_of_one(file_bytes, filename)
+
         create_body = {
             "name": name or filename,
             "stream_id": stream_id,
             "ledger": ledger or settings.DEFAULT_LEDGER,
             "filename": filename,
-            "estimated_size": len(file_bytes),
+            # The size of what is uploaded, not of the media: the presigned part count is
+            # derived from it, and a stored zip is a few hundred bytes larger than its entry.
+            "estimated_size": len(payload),
             "ai_disclosure": disclosure,
         }
         if title is not None:
@@ -154,7 +169,7 @@ class OnmintClient:
 
         # Presigned upload URLs are served on GET while the attachment is RECEIVED/REVIEWED.
         attachment = await self._await_presigned(attachment_id)
-        await self._upload(attachment_id, attachment, file_bytes)
+        await self._upload(attachment_id, attachment, payload)
 
         if not wait:
             return await self.get_status(attachment_id)
@@ -227,8 +242,13 @@ class OnmintClient:
 
     # ---------------------------------------------------- credentialed file
     async def fetch_ipfs(self, cid: str) -> bytes:
-        """Fetch the credentialed (watermarked + C2PA-signed) file bytes from the IPFS gateway."""
-        url = f"{settings.IPFS_GATEWAY}/ipfs/{cid}"
+        """Fetch bytes from the public IPFS gateway: a bare CID, or `<dir cid>/<name>`.
+
+        Which CID holds the credentialed file is the caller's decision (see server._submit):
+        an embedded-manifest file is raw-pinned at `c2pa_manifest_cid`, while `ipfs_cid` is
+        the pre-signing deliverable wrapped in a directory, whose bare CID is a listing.
+        """
+        url = ipfs_url(cid)
         async with self._client() as c:
             resp = await c.get(url)
         if resp.status_code >= 400:
@@ -410,5 +430,128 @@ def _disposition_filename(header: Optional[str]) -> Optional[str]:
     return msg.get_filename()
 
 
+def ipfs_url(cid_path: str) -> str:
+    """Public gateway URL for a bare CID or a `<dir cid>/<name>` path."""
+    return f"{settings.IPFS_GATEWAY}/ipfs/{cid_path}"
+
+
+def zip_of_one(file_bytes: bytes, filename: str) -> bytes:
+    """Wrap one file in a single-entry zip, the upload shape the watermark ingest reads.
+
+    A file whose name already says .zip is sent as it is: it already is what the ingest
+    unzips, and every file in it is then validated and billed on its own, exactly as a
+    webapp archive upload is. Anything else becomes one entry named after the file's
+    basename, since the ingest takes the type from the entry's extension and its bytes.
+
+    Stored, not deflated: every supported media format is already compressed, so deflate
+    only spends CPU (and, on a 100 MB video, noticeable time) to save nothing.
+
+    TODO(streaming): this builds the whole archive in memory next to the decoded upload.
+    Fine at the per-file caps; the streaming refactor should write it straight to the PUT.
+    """
+    if filename.lower().endswith(".zip"):
+        return file_bytes
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr(os.path.basename(filename) or filename, file_bytes)
+    return buf.getvalue()
+
+
+# The canonical media types of the main pipeline, keyed by extension, ahead of `mimetypes`.
+# `mimetypes` reads the host's tables, and python:3.12-slim (the hosted image) has no
+# /etc/mime.types: there .flac and .m4a come back as None (sent as application/octet-stream),
+# .wav as audio/x-wav and .avi as video/avi or nothing, depending on the Python build. The
+# API resolves the type from the part's content type first, so a host-dependent guess meant
+# the same file verified differently on a laptop and on the hosted server. The JPEG, PNG,
+# WebP, TIFF, GIF, PDF and zip values are the ones `mimetypes` already produced, so the
+# mintys upload, which also goes through `_mime`, sends what it sent before; a .heic/.heif
+# there now says image/heic|heif instead of the host's guess, which mintys only reads as a
+# hint (it sniffs the bytes at intake and keeps its own HEIC->JPEG transcode).
+_EXT_MIME = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".webp": "image/webp", ".tif": "image/tiff", ".tiff": "image/tiff",
+    ".gif": "image/gif", ".svg": "image/svg+xml",
+    ".heic": "image/heic", ".heif": "image/heif", ".avif": "image/avif",
+    ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".flac": "audio/flac", ".wav": "audio/wav",
+    ".mp4": "video/mp4", ".mov": "video/quicktime", ".avi": "video/x-msvideo",
+    ".pdf": "application/pdf", ".zip": "application/zip",
+}
+
+
 def _mime(filename: str) -> str:
-    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    ext = os.path.splitext(filename or "")[1].lower()
+    return _EXT_MIME.get(ext) or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
+def is_audio_video(mime: Optional[str]) -> bool:
+    return bool(mime) and mime.split("/", 1)[0] in ("audio", "video")
+
+
+# ISO-BMFF major brands (bytes 8..12 of an `ftyp` box) -> extension. Anything else with an
+# ftyp box is treated as MP4, which is what the remaining brands (isom, mp41, mp42, avc1,
+# dash, ...) are. `mif1`/`msf1` are the generic HEIF brands and are decided from the
+# compatible brands instead: an AVIF is commonly `mif1` + `avif`.
+_FTYP_BRANDS = {
+    b"qt  ": ".mov",
+    b"heic": ".heic", b"heix": ".heic", b"heim": ".heic", b"heis": ".heic",
+    b"hevc": ".heic", b"hevx": ".heic",
+    b"avif": ".avif", b"avis": ".avif",
+    b"M4A ": ".m4a", b"M4B ": ".m4a", b"M4P ": ".m4a",
+}
+# Top-level QuickTime atoms an older .mov can start with instead of `ftyp`.
+_QT_LEADING_ATOMS = (b"moov", b"mdat", b"wide", b"free", b"skip", b"pnot")
+
+
+def sniff_extension(data: bytes) -> Optional[str]:
+    """The extension the leading bytes say this file has, or None when they say nothing.
+
+    Used only when a caller sends base64 with no `filename`, which used to be named
+    `upload.png` whatever it held: a WAV, FLAC, AVI, SVG or ftyp-less MOV then reached the
+    API as image/png (the ingest's own sniff does not recognise those and so never overrode
+    the extension), and verify handed an MP4 to the C2PA reader as a PNG and reported no
+    credentials. Deliberately a short list of unambiguous signatures: a wrong guess here is
+    worse than asking the caller for the name, which is what None leads to.
+    """
+    head = data[:4096]
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    # Classic and BigTIFF, both byte orders. A DNG/NEF/CR2/ARW is TIFF-based and lands here
+    # too; the ingest recognises and refuses those from the bytes, whatever the name says.
+    if head[:4] in (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"):
+        return ".tif"
+    if head.startswith(b"%PDF-"):
+        return ".pdf"
+    if head.startswith(b"fLaC"):
+        return ".flac"
+    if head.startswith(b"RIFF") and len(head) >= 12:
+        return {b"WAVE": ".wav", b"AVI ": ".avi", b"WEBP": ".webp"}.get(head[8:12])
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        major = head[8:12]
+        if major in _FTYP_BRANDS:
+            return _FTYP_BRANDS[major]
+        if major in (b"mif1", b"msf1"):
+            box_len = int.from_bytes(head[0:4], "big")
+            compatible = head[16:min(box_len, len(head))]
+            brands = {compatible[i:i + 4] for i in range(0, len(compatible) - 3, 4)}
+            if brands & {b"avif", b"avis"}:
+                return ".avif"
+            if brands & {b"heic", b"heix", b"heim", b"heis"}:
+                return ".heic"
+            return ".heif"
+        return ".mp4"
+    if len(head) >= 8 and head[4:8] in _QT_LEADING_ATOMS:
+        return ".mov"
+    if head.startswith(b"ID3"):
+        return ".mp3"
+    # An MPEG audio frame sync with a real layer (bits 1-2 of the second byte non-zero):
+    # ADTS AAC shares the 11-bit sync but has layer 00, and JPEG was matched above.
+    if len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0 and (head[1] & 0x06):
+        return ".mp3"
+    text = head.removeprefix(b"\xef\xbb\xbf").lstrip().lower()
+    if text.startswith((b"<svg", b"<?xml", b"<!--", b"<!doctype svg")) and b"<svg" in text:
+        return ".svg"
+    return None

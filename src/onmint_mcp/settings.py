@@ -15,8 +15,9 @@ DEFAULT_LEDGER = os.environ.get("ONMINT_DEFAULT_LEDGER", "POLYGON_POS")
 POLL_INTERVAL_SECONDS = float(os.environ.get("ONMINT_POLL_INTERVAL_SECONDS", "5"))
 POLL_TIMEOUT_SECONDS = float(os.environ.get("ONMINT_POLL_TIMEOUT_SECONDS", "1800"))
 
-# Public IPFS gateway used to fetch the credentialed (watermarked + C2PA-signed) file bytes
-# back, and the public app base for share/verify URLs.
+# Public IPFS gateway used to fetch the credentialed file back (the C2PA-signed file, which
+# is also watermarked only for JPEG/PNG/WebP/TIFF), and the public app base for share/verify
+# URLs.
 IPFS_GATEWAY = os.environ.get("ONMINT_IPFS_GATEWAY", "https://ipfs.pub.dev-onmint.com").rstrip("/")
 # Defaults to the DEV app. NOT `app.dev-onmint.com`: that legacy host is still live but is
 # served the PRODUCTION bundle by the shared webapp load balancer, so it points at the prod
@@ -36,6 +37,21 @@ TRANSPORT = os.environ.get("ONMINT_MCP_TRANSPORT", "stdio")
 # environment (see http_auth.py), and the tool arguments that touch the local filesystem are
 # refused, because "local" is then the server's disk and not the caller's.
 HOSTED = TRANSPORT != "stdio"
+
+# Per-file size caps of the main pipeline, mirrored so an oversized file is refused here with
+# a clear message instead of after it was decoded, zipped and uploaded, and then failed by the
+# ingest. The pipeline is the authority (onmint-service-watermark MAX_FILE_SIZE_MB and
+# MAX_AV_FILE_SIZE_MB); keep these equal to it. Audio and video are capped lower because the
+# credentials-only path still holds each file whole in memory in several services.
+MAX_FILE_SIZE_MB = float(os.environ.get("MAX_FILE_SIZE_MB", "200"))
+MAX_AV_FILE_SIZE_MB = float(os.environ.get("MAX_AV_FILE_SIZE_MB", "100"))
+# The verify-by-file upload cap of the API (/authenticity/verify).
+VERIFY_MAX_FILE_MB = float(os.environ.get("ONMINT_VERIFY_MAX_FILE_MB", "100"))
+# The largest file whose credentialed copy is returned INLINE as base64 (`return_file`). A
+# base64 copy is a third copy of the file in this process on top of the upload and the IPFS
+# fetch, all inside one JSON-RPC response; above this, and for every audio or video file,
+# the result carries `credentialed_file_url` (the public gateway URL) instead.
+MAX_INLINE_RETURN_MB = float(os.environ.get("ONMINT_MCP_MAX_INLINE_RETURN_MB", "25"))
 
 # Bind address for the hosted transport. 0.0.0.0 because in a container the listener has to
 # be reachable from outside the pod's own loopback — FastMCP defaults to 127.0.0.1, and the
