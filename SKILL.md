@@ -1,11 +1,12 @@
 ---
 name: onmint-authenticity
 description: >-
-  Protect original content or attach an EU AI Act label to AI-generated content, and verify
-  the authenticity / AI content of ANY image, via the on:mint authenticity API. Use when a
-  task involves proving an image is an authored original, labeling AI-generated output as
-  synthetic (C2PA + invisible watermark + on-chain anchor), or checking whether an image is
-  AI-generated / manipulated.
+  Protect original content or attach an EU AI Act label to AI-generated content (images,
+  audio, video or PDF), and verify the authenticity of any such file or the AI content of
+  an image, via the on:mint authenticity API. Use when a task involves proving a file is an
+  authored original, labeling AI-generated output as synthetic (signed C2PA credentials +
+  on-chain anchor, plus an invisible watermark on JPEG/PNG/WebP/TIFF), or checking whether
+  an image is AI-generated / manipulated.
 ---
 
 # on:mint authenticity
@@ -14,7 +15,7 @@ description: >-
 
 Every submission carries a required `ai_declaration`. It is the authoritative AI label — what
 gets written into the signed C2PA manifest as an IPTC `digitalSourceType` (EU AI Act Art. 50)
-and encoded in the watermark:
+for every format, and is also encoded in the watermark on the formats that carry one:
 
 | Declaration | Means |
 |---|---|
@@ -27,15 +28,32 @@ and encoded in the watermark:
 costs nothing. **Ask the user which one applies** — do not infer it from the file or from how
 the image looks. This is a statement made in their name and it is cryptographically signed.
 
-One pipeline either way: invisible watermark + C2PA Content Credentials + on-chain anchor.
+One pipeline either way: signed C2PA Content Credentials + on-chain anchor, plus an invisible
+watermark for the formats that take one:
 
-An AI detector still runs, and it no longer decides anything. Its reading is returned as a
-secondary *automated assessment* in one of three tiers (no / isolated / clear AI signals
-detected) and never overrides the declaration. The two are allowed to disagree — a detector is
+| Format | What a submission gets |
+|---|---|
+| JPEG, PNG, WebP, TIFF | **Full pipeline**: invisible watermark + C2PA Content Credentials embedded in the file + AI check + on-chain anchor. |
+| SVG, GIF, HEIC, HEIF, AVIF, MP3, M4A, FLAC, WAV, MP4, MOV, AVI | **Credentials only**: the C2PA manifest is embedded in the file in its **original format** (no transcode) + on-chain anchor. **No watermark** (no soft binding), and the AI check is recorded as **not assessed**. |
+| PDF | C2PA manifest as a detached `.c2pa` sidecar + on-chain anchor (unchanged). |
+
+An animated WebP or APNG, and a multi-page or high-bit-depth (16-bit, float, CMYK) TIFF, is
+detected from its bytes and handled as **credentials only**, so a watermark would never
+degrade it. Camera raws built on TIFF (DNG, NEF, CR2, ARW) are refused. Per file: audio and
+video up to **100 MB**, everything else up to **200 MB**.
+
+A credentials-only file reports `watermarked: false`, `delivery: "credentials_only"`,
+`soft_binding_supported: false` (with `credentials_only_reason`) and `ai_check_assessed: false`.
+That is the expected outcome for the format, not a failure.
+
+Where the format has an AI check, the detector no longer decides anything. Its reading is
+returned as a secondary *automated assessment* in one of three tiers (no / isolated / clear AI
+signals detected) and never overrides the declaration. The two are allowed to disagree — a detector is
 one model's opinion about pixels, a declaration is a statement by an identified party.
 
 Two further options on every submit tool: `visible_ai_label` burns the visible AI label into
-the pixels (only accepted for `AI_MODIFIED` / `AI_GENERATED`), and
+the pixels (only accepted for `AI_MODIFIED` / `AI_GENERATED`, and only applies to
+JPEG/PNG/WebP/TIFF; a credentials-only file carries its label in the manifest alone), and
 `allow_ai_training_and_mining` (default `false` = refuse) writes the standard
 `c2pa.training-mining` assertion.
 
@@ -46,12 +64,12 @@ the pixels (only accepted for `AI_MODIFIED` / `AI_GENERATED`), and
 | Submit content with an explicit declaration | `submit_content` |
 | An AI tool attaching a secure AI label to its own output (Art. 50), getting the labeled file back — declares `AI_GENERATED` | `label_ai_output` |
 | Protect an authored original — declares `CREATED_WITHOUT_AI` | `protect_original` |
-| Verify any image (even one we never stored) + its provenance | `verify_image` |
+| Verify any image, audio, video or PDF file (even one we never stored) + its provenance | `verify_image` |
 | Report the AI signals an image carries | `analyze_image` |
 | Poll a `wait=false` submission | `get_status` |
 | Look up an asset's provenance by watermark id / SHA-256 | `get_provenance` |
 | Get a ready-to-submit stream (reuse or auto-provision) | `ensure_stream` |
-| mintys: label one image or a zip batch through the mintys job pipeline | `mintys_label_images` |
+| mintys: label one image or a zip batch through the mintys job pipeline (images + PDF only) | `mintys_label_images` |
 | mintys: poll a `wait=false` job, fetch its output, or drop it early | `get_mintys_job` / `delete_mintys_job` |
 | Find a `label_template` id (how the visible AI label looks) | `list_label_templates` |
 | List / create ASSET templates, vaults, streams over the API (not label templates) | `list_*` / `create_template` / `create_vault` / `create_stream` |
@@ -60,8 +78,9 @@ the pixels (only accepted for `AI_MODIFIED` / `AI_GENERATED`), and
 `protect_original`): omit it to use the organization's default; take an id from
 `list_label_templates`. An unknown id is refused and nothing is labelled with a substitute.
 
-`label_ai_output` returns the **credentialed file** (base64) plus a public `verify_url` by
-default; pass `save_to=<path>` to also write it. All submit tools take an **optional**
+`label_ai_output` returns the **credentialed file** plus a public `verify_url` by default:
+always as `credentialed_file_url`, and inline as base64 too except for audio/video and large
+files. Pass `save_to=<path>` to also write it. All submit tools take an **optional**
 `stream_id` — omit it and one is reused/provisioned automatically.
 
 ## Setup
@@ -83,11 +102,19 @@ Get credentials from `POST /register`, then manage additional scoped keys under 
   and the server reuses an existing stream or provisions a template → vault → stream. Set
   `ONMINT_DEFAULT_STREAM_ID` to pin one and skip provisioning (recommended for repeated use;
   API vault creation can be slow to settle in some environments).
-- **Images only** get an invisible watermark; other blobs are provenance-only (hash + C2PA
-  sidecar). AI classification still applies.
-- **`verify_image` / `analyze_image` work on any image** — no prior submission needed. A
-  `match_method` of `none` means the image is unknown to on:mint; the AI analysis is still
-  returned.
+- **Only JPEG/PNG/WebP/TIFF get an invisible watermark and an AI check.** SVG, GIF,
+  HEIC/HEIF/AVIF, audio and video get an embedded C2PA manifest in their original format and
+  nothing else: no watermark, AI check not assessed. PDF gets a detached sidecar. See the
+  table above. Never promise a watermark or a detector reading for a credentials-only file.
+- **The submit tools take any supported file** through `image_path` / `image_base64` (the
+  names are kept for compatibility). With `image_base64`, pass `filename` with the real
+  extension; without one the type is read from the bytes, and bytes it cannot identify are
+  refused.
+- **`verify_image` works on any supported file** (up to 100 MB) — no prior submission needed.
+  A credentials-only file matches only as the exact file (by its original or its credentialed
+  hash, or its embedded manifest): there is no watermark to recover from a re-encoded or
+  cropped copy. A `match_method` of `none` means the file is unknown to on:mint.
+- **`analyze_image` is for images.** There is no AI analysis for audio, video or SVG.
 - AI-generation probability is a **calibrated estimate**, not ground truth — present it as a
   probability, never as proof.
 
@@ -97,7 +124,8 @@ The same operations are available over HTTP for CI/CD and scripts (all API-key g
 
 - `POST /v1/authenticity/attachments` → create submission (**`ai_disclosure.declaration`
   required**; 422 without it) → then
-  `GET` for presigned upload URLs → upload → `PUT` to complete (multipart) → `GET` to poll.
+  `GET` for presigned upload URLs → upload **a zip containing the file** (the MCP tools do this
+  for you) → `PUT` to complete (multipart) → `GET` to poll.
 - `POST /v1/authenticity/verify` (multipart) → verify-by-file.
 - `POST /v1/authenticity/analyze` (multipart) → AI content analysis. Returns
   `ai_signal_assessment` (tier + raw score); the old `ai_content_share` percentage is gone.

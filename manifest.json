@@ -3,7 +3,7 @@
   "name": "onmint-authenticity",
   "display_name": "on:mint Content Credentials",
   "version": "0.1.0",
-  "description": "Protect originals or attach a secure EU-AI-Act label to AI-generated output, and verify the authenticity / AI content of any image — over the on:mint Content Credentials API.",
+  "description": "Protect originals or attach a secure EU-AI-Act label to AI-generated output, and verify the authenticity of any image, audio, video or PDF file (or the AI content of an image) — over the on:mint Content Credentials API.",
   "author": { "name": "on:mint" },
   "server": {
     "type": "python",

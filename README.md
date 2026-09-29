@@ -1,34 +1,56 @@
 # onmint-mcp
 
 MCP server exposing the **on:mint authenticity API** — protect originals or attach an EU AI
-Act label to AI-generated content, and verify the authenticity / AI content of any image.
+Act label to AI-generated content (images, audio, video or PDF), and verify the authenticity
+of any such file or the AI content of an image.
 
 **You declare, we sign.** Every submission carries a required `ai_declaration` —
 `CREATED_WITHOUT_AI`, `AI_ENHANCED`, `AI_MODIFIED` or `AI_GENERATED` — and that declaration
 is the authoritative AI label: it is written into the signed C2PA manifest as an IPTC
-`digitalSourceType` and encoded in the watermark. One pipeline either way (watermark + C2PA +
-on-chain anchor).
+`digitalSourceType`, and also encoded in the watermark on the formats that carry one. One
+pipeline either way (C2PA + on-chain anchor, plus a watermark where the format takes one).
 
-An AI detector still runs, and it no longer decides anything. Its reading comes back as a
-secondary automated assessment in one of three tiers and never overrides the declaration.
+Where the format has an AI check, the detector no longer decides anything. Its reading comes
+back as a secondary automated assessment in one of three tiers and never overrides the
+declaration.
+
+## Supported formats
+
+| Format | What a submission gets |
+|---|---|
+| JPEG, PNG, WebP, TIFF | **Full pipeline**: invisible watermark + C2PA Content Credentials embedded in the file + AI check + on-chain anchor. |
+| SVG, GIF, HEIC, HEIF, AVIF, MP3, M4A, FLAC, WAV, MP4, MOV, AVI | **Credentials only**: the C2PA manifest is embedded in the file in its **original format** (no transcode) + on-chain anchor. **No watermark** (no soft binding), and the AI check is recorded as **not assessed**. |
+| PDF | C2PA manifest as a detached `.c2pa` sidecar + on-chain anchor (unchanged). |
+
+An animated WebP or APNG, and a multi-page or high-bit-depth (16-bit, float, CMYK) TIFF, is
+detected from its bytes and handled as **credentials only**, so a watermark would never
+degrade it. Camera raws built on TIFF (DNG, NEF, CR2, ARW) are refused. Per file: audio and
+video up to **100 MB**, everything else up to **200 MB**.
+
+A credentials-only file reports `watermarked: false`, `delivery: "credentials_only"`,
+`soft_binding_supported: false` (with `credentials_only_reason`) and `ai_check_assessed: false`.
+That is the expected outcome for the format, not a failure.
 
 ## Tools
 
 **Content**
-- `submit_content` — submit an image. **Requires `ai_declaration`** — ask the user, do not
-  guess: it is signed in their name.
+- `submit_content` — submit an image, audio, video or PDF file. **Requires `ai_declaration`**
+  — ask the user, do not guess: it is signed in their name.
 - `label_ai_output` — attach a secure AI label to AI-generated output (for AI-tool providers);
-  declares `AI_GENERATED`. Returns the **credentialed file** (base64) + a public `verify_url`
-  by default.
+  declares `AI_GENERATED`. Returns the **credentialed file** (`credentialed_file_url`, and
+  base64 too except for audio/video and large files) + a public `verify_url` by default.
 - `protect_original` — protect an authored original; declares `CREATED_WITHOUT_AI` (override
   with `AI_ENHANCED` for AI retouching/upscaling).
-- `verify_image` — verify any image (hash → watermark → pHash) + C2PA validation.
-- `analyze_image` — report the AI signals an image carries, as one of three tiers.
+- `verify_image` — verify any supported file (hash → watermark → pHash) + C2PA validation.
+  Watermark and pHash only exist for JPEG/PNG/WebP/TIFF; a credentials-only file matches as
+  the exact file only.
+- `analyze_image` — report the AI signals an image carries, as one of three tiers (images only).
 - `get_status` — poll a `wait=false` submission.
 - `get_provenance` — look up provenance by watermark id or SHA-256.
 
 **mintys** (the mintys job pipeline: no stream, no IPFS, no on-chain anchor)
-- `mintys_label_images` — label one image or a `.zip` batch. One `ai_declaration` for the
+- `mintys_label_images` — label one image or a `.zip` batch (images + PDF only; not the
+  audio/video/credentials-only formats above). One `ai_declaration` for the
   whole upload, or `auto_label=true`. Waits and returns the labelled output by default.
 - `get_mintys_job` / `delete_mintys_job` — poll a `wait=false` job (and fetch its output),
   or drop its temporary output early.
@@ -144,7 +166,14 @@ curl -o ~/.claude/skills/onmint-authenticity/SKILL.md \
 
 - `stream_id` is optional — omit it and a stream is reused/provisioned automatically
   (set `ONMINT_DEFAULT_STREAM_ID` to pin one and skip provisioning).
-- Images are provided as a local `image_path` or `image_base64`.
+- Files are provided as a local `image_path` or `image_base64` (the names are kept for
+  compatibility; they take any supported file). With `image_base64`, pass `filename` with the
+  real extension; without it the type is read from the bytes, and unrecognised bytes are
+  refused. The submit tools upload the file as a zip-of-one, which is what the pipeline reads.
+- Size caps (mirroring the pipeline): `MAX_AV_FILE_SIZE_MB` (100) for audio/video,
+  `MAX_FILE_SIZE_MB` (200) otherwise, `ONMINT_VERIFY_MAX_FILE_MB` (100) for `verify_image`.
+  A credentialed file is returned inline only up to `ONMINT_MCP_MAX_INLINE_RETURN_MB` (25) and
+  never for audio/video; `credentialed_file_url` is always returned.
 - Get credentials from `POST /register` on the API, then manage keys under `/keys` (or the
   web app's Developers page).
 - See `SKILL.md` for the agent-facing skill description.
