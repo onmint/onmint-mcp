@@ -55,6 +55,38 @@ def test_sniff_extension(data, ext):
     assert sniff_extension(data) == ext
 
 
+def _ftyp(major: bytes, *compatible: bytes) -> bytes:
+    body = b"ftyp" + major + b"\x00\x00\x00\x00" + b"".join(compatible)
+    return (len(body) + 4).to_bytes(4, "big") + body + b"\x00" * 64
+
+
+# Formats the ingest refuses only by EXTENSION (camera raws, and the unsold ISO-BMFF
+# variants). A made-up name must never be one the ingest sells, or the refusal is bypassed:
+# an unsold brand gets its own extension, and an unknown brand (CR3's `crx `) gets none.
+@pytest.mark.parametrize("data,ext", [
+    (_ftyp(b"M4B ", b"M4B ", b"mp42"), ".m4b"), (_ftyp(b"M4P ", b"M4P ", b"mp42"), ".m4p"),
+    (_ftyp(b"M4V ", b"M4V ", b"mp42"), ".m4v"), (_ftyp(b"3gp4", b"3gp4", b"isom"), ".3gp"),
+    (_ftyp(b"3gp5", b"3gp5"), ".3gp"), (_ftyp(b"3g2a", b"3g2a"), ".3g2"),
+    (_ftyp(b"crx ", b"crx ", b"isom"), None), (_ftyp(b"f4v ", b"isom"), None),
+])
+def test_sniff_never_names_an_unsold_iso_bmff_brand_as_a_sold_format(data, ext):
+    assert sniff_extension(data) == ext
+
+
+@pytest.mark.parametrize("major", [b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41",
+                                   b"mp42", b"mp71", b"avc1", b"dash", b"mmp4"])
+def test_sniff_names_the_sold_mp4_brands_mp4(major):
+    assert sniff_extension(_ftyp(major, b"isom")) == ".mp4"
+
+
+@pytest.mark.parametrize("data,ext", [
+    (_ftyp(b"miaf", b"miaf", b"avif"), ".avif"), (_ftyp(b"miaf", b"miaf", b"heic"), ".heic"),
+    (_ftyp(b"miaf", b"miaf"), ".heif"),
+])
+def test_sniff_decides_a_miaf_major_brand_from_the_compatible_brands(data, ext):
+    assert sniff_extension(data) == ext
+
+
 @pytest.mark.parametrize("data", [b"hello world", ADTS_AAC, b"<html><body/></html>", b""])
 def test_sniff_says_nothing_rather_than_guess(data):
     assert sniff_extension(data) is None

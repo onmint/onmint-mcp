@@ -490,17 +490,35 @@ def is_audio_video(mime: Optional[str]) -> bool:
     return bool(mime) and mime.split("/", 1)[0] in ("audio", "video")
 
 
-# ISO-BMFF major brands (bytes 8..12 of an `ftyp` box) -> extension. Anything else with an
-# ftyp box is treated as MP4, which is what the remaining brands (isom, mp41, mp42, avc1,
-# dash, ...) are. `mif1`/`msf1` are the generic HEIF brands and are decided from the
-# compatible brands instead: an AVIF is commonly `mif1` + `avif`.
+# ISO-BMFF major brands (bytes 8..12 of an `ftyp` box) -> extension. Only brands whose
+# answer is certain are named, and an unknown brand is silence (None: the caller is asked
+# for `filename`), never a guess. It used to be the other way round: every brand not listed
+# fell through to `.mp4`, and M4B/M4P were named `.m4a`. The ingest refuses Canon's CR3 raw
+# (`crx `), 3GP/3G2 phone clips, iTunes M4V video and M4B/M4P audiobooks by EXTENSION only
+# (_CAMERA_RAW_EXTENSIONS / _UNSOLD_EXTENSIONS in service-watermark ingest_validation), and
+# its own sniff either says nothing about those bytes (`crx `) or calls them MP4/M4A, so a
+# name made up here was the declared type and it stood: a nameless CR3 was accepted,
+# credentialed, anchored and billed as a VIDEO/MP4. So the unsold brands get their OWN
+# extensions, which the ingest then refuses by name exactly as it would the caller's file,
+# and `.mp4` is given only for the MP4 brands of the ingest's _ISOBMFF_MEDIA_BRANDS.
+# `mif1`/`msf1`/`miaf` are the generic HEIF brands and are decided from the compatible
+# brands instead (see sniff_extension): an AVIF is commonly `mif1` + `avif`.
 _FTYP_BRANDS = {
     b"qt  ": ".mov",
     b"heic": ".heic", b"heix": ".heic", b"heim": ".heic", b"heis": ".heic",
     b"hevc": ".heic", b"hevx": ".heic",
     b"avif": ".avif", b"avis": ".avif",
-    b"M4A ": ".m4a", b"M4B ": ".m4a", b"M4P ": ".m4a",
+    b"M4A ": ".m4a",
+    # Not sold: named so the ingest refuses them by extension (see above).
+    b"M4B ": ".m4b", b"M4P ": ".m4p", b"M4V ": ".m4v",
+    **{brand: ".mp4" for brand in (b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41",
+                                   b"mp42", b"mp71", b"avc1", b"dash", b"mmp4")},
 }
+# 3GPP (`3gp4`, `3gp5`, `3gp6`, `3ge6`, ...) and 3GPP2 (`3g2a`, ...) brands, matched by
+# prefix since the version digit varies. Not sold; named so the ingest refuses them.
+_FTYP_BRAND_PREFIXES = ((b"3g2", ".3g2"), (b"3gp", ".3gp"), (b"3ge", ".3gp"),
+                        (b"3gg", ".3gp"), (b"3gr", ".3gp"), (b"3gs", ".3gp"))
+_FTYP_GENERIC_IMAGE_BRANDS = (b"mif1", b"msf1", b"miaf")
 # Top-level QuickTime atoms an older .mov can start with instead of `ftyp`.
 _QT_LEADING_ATOMS = (b"moov", b"mdat", b"wide", b"free", b"skip", b"pnot")
 
@@ -536,7 +554,7 @@ def sniff_extension(data: bytes) -> Optional[str]:
         major = head[8:12]
         if major in _FTYP_BRANDS:
             return _FTYP_BRANDS[major]
-        if major in (b"mif1", b"msf1"):
+        if major in _FTYP_GENERIC_IMAGE_BRANDS:
             box_len = int.from_bytes(head[0:4], "big")
             compatible = head[16:min(box_len, len(head))]
             brands = {compatible[i:i + 4] for i in range(0, len(compatible) - 3, 4)}
@@ -545,7 +563,12 @@ def sniff_extension(data: bytes) -> Optional[str]:
             if brands & {b"heic", b"heix", b"heim", b"heis"}:
                 return ".heic"
             return ".heif"
-        return ".mp4"
+        for prefix, ext in _FTYP_BRAND_PREFIXES:
+            if major.startswith(prefix):
+                return ext
+        # Anything else (`crx ` = Canon CR3 raw, `f4v `, a vendor brand): say nothing
+        # rather than guess a sold format for it.
+        return None
     if len(head) >= 8 and head[4:8] in _QT_LEADING_ATOMS:
         return ".mov"
     if head.startswith(b"ID3"):
