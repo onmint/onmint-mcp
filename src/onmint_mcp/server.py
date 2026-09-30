@@ -206,8 +206,9 @@ async def label_ai_output(image_path: Optional[str] = None,
     existing asset rather than generating it from nothing; the other two values are not
     appropriate here and `protect_original` is the tool for them.
 
-    The declaration is signed into the C2PA manifest as an IPTC digitalSourceType and encoded
-    in the watermark. Set `visible_ai_label=true` to also burn the visible label into the
+    The declaration is signed into the C2PA manifest (as an IPTC digitalSourceType on a
+    c2pa.edited action, plus the com.onmint.ai-declaration assertion) and encoded in the
+    watermark. Set `visible_ai_label=true` to also burn the visible label into the
     pixels. `stream_id` is optional (auto-provisioned). By default returns the labeled file
     bytes (base64) plus provenance and a public verify URL; pass save_to to also write it out.
 

@@ -12,9 +12,12 @@ description: >-
 
 **You declare, we sign, the detector comments.**
 
-Every submission carries a required `ai_declaration`. It is the authoritative AI label — what
-gets written into the signed C2PA manifest as an IPTC `digitalSourceType` (EU AI Act Art. 50)
-and encoded in the watermark:
+Every submission carries a required `ai_declaration`. It is the authoritative AI label — signed
+into the C2PA manifest as the rights holder's statement (the `com.onmint.ai-declaration`
+assertion) and encoded in the watermark. The AI declarations (`AI_ENHANCED`, `AI_MODIFIED`,
+`AI_GENERATED`) are also written as an IPTC `digitalSourceType` on a `c2pa.edited` action
+(EU AI Act Art. 50); `CREATED_WITHOUT_AI` gets no IPTC term and is recorded only in
+`com.onmint.ai-declaration`:
 
 | Declaration | Means |
 |---|---|

@@ -5,8 +5,12 @@ Act label to AI-generated content, and verify the authenticity / AI content of a
 
 **You declare, we sign.** Every submission carries a required `ai_declaration` —
 `CREATED_WITHOUT_AI`, `AI_ENHANCED`, `AI_MODIFIED` or `AI_GENERATED` — and that declaration
-is the authoritative AI label: it is written into the signed C2PA manifest as an IPTC
-`digitalSourceType` and encoded in the watermark. One pipeline either way (watermark + C2PA +
+is the authoritative AI label: it is signed into the C2PA manifest as the rights holder's
+statement (the `com.onmint.ai-declaration` assertion) and encoded in the watermark. The AI
+declarations (`AI_ENHANCED`, `AI_MODIFIED`, `AI_GENERATED`) are also written as an IPTC
+`digitalSourceType` (e.g. `trainedAlgorithmicMedia`, `compositeWithTrainedAlgorithmicMedia`)
+on a `c2pa.edited` action; `CREATED_WITHOUT_AI` is not turned into an IPTC term and is
+recorded only in `com.onmint.ai-declaration`. One pipeline either way (watermark + C2PA +
 on-chain anchor).
 
 An AI detector still runs, and it no longer decides anything. Its reading comes back as a
