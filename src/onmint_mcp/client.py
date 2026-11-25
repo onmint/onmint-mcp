@@ -18,12 +18,49 @@ import httpx
 from onmint_mcp import settings
 
 _PART_SIZE = 30 * 1024 * 1024  # 30 MB — matches the backend multipart threshold
+
+# The four declarations a rights holder may choose. Mirrored here as plain strings rather
+# than imported, because this package deliberately depends on nothing but httpx and mcp — an
+# MCP server a developer installs with `pip install git+...` should not drag in the platform's
+# internal packages. The API is the authority: an unknown value is rejected there with a 422,
+# so this list can only ever be a nicer error, never a second source of truth.
+AI_DECLARATIONS = ("CREATED_WITHOUT_AI", "AI_ENHANCED", "AI_MODIFIED", "AI_GENERATED")
 _PRESIGN_READY = {"FILEDGR_RECEIVED", "FILEDGR_REVIEWED"}
 _TERMINAL = {"FILEDGR_DATA_ATTACHMENT_COMPLETED", "ERROR"}
 
 
 class OnmintApiError(RuntimeError):
     pass
+
+
+# The stable code the API answers a `label_template` it cannot resolve with.
+TEMPLATE_UNKNOWN = "MINTYS_TEMPLATE_UNKNOWN"
+
+
+class LabelTemplateUnknownError(OnmintApiError):
+    """`label_template` names a template the organization does not have.
+
+    Its own type because the right reaction differs from every other 400: nothing was
+    submitted and nothing was labelled with a substitute, and the fix is to re-read the
+    templates, not to change code. The message says so, since it is what a calling model reads.
+    """
+
+
+def _raise_for(method: str, path: str, resp: httpx.Response) -> None:
+    if resp.status_code < 400:
+        return
+    if resp.status_code == 400:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and body.get("error") == TEMPLATE_UNKNOWN:
+            raise LabelTemplateUnknownError(
+                f"{TEMPLATE_UNKNOWN}: the label_template id is not one of this organization's "
+                "label templates. Nothing was submitted and nothing was labelled with a "
+                "substitute template. Call list_label_templates for the valid ids, or omit "
+                "label_template to use the organization's default.")
+    raise OnmintApiError(f"{method} {path} -> {resp.status_code}: {resp.text[:400]}")
 
 
 class OnmintClient:
@@ -46,8 +83,7 @@ class OnmintClient:
         url = f"{self._base}{path}"
         async with self._client() as c:
             resp = await c.request(method, url, headers=self._headers, **kw)
-        if resp.status_code >= 400:
-            raise OnmintApiError(f"{method} {path} -> {resp.status_code}: {resp.text[:400]}")
+        _raise_for(method, path, resp)
         return resp.json() if resp.content else None
 
     # --------------------------------------------------------------- submit
@@ -55,30 +91,63 @@ class OnmintClient:
                               stream_id: str,
                               file_bytes: bytes,
                               filename: str,
+                              ai_declaration: str,
                               name: Optional[str] = None,
-                              declared_ai: Optional[bool] = None,
+                              non_ai_medium: Optional[str] = None,
+                              visible_ai_label: bool = False,
+                              allow_ai_training_and_mining: bool = False,
                               title: Optional[str] = None,
                               category: Optional[str] = None,
                               ledger: Optional[str] = None,
-                              wait: bool = True) -> dict:
+                              wait: bool = True,
+                              label_template: Optional[str] = None) -> dict:
         """Create a submission, upload the file, and (optionally) wait for the pipeline to finish.
+
+        `ai_declaration` is REQUIRED and positional-by-convention (it sits ahead of every
+        optional argument) because the API requires it: a submission without one is rejected
+        with a 422 and no credit is spent. It is the authoritative AI label — what gets signed
+        into the C2PA manifest — so there is no default here either. Guessing it on the
+        caller's behalf would be putting words in a rights holder's mouth, cryptographically.
+
+        `label_template` names one of the organization's label templates (how the visible
+        label LOOKS). It is put on the wire only when given: an omitted field is what tells
+        the API to use the organization's default, and an explicit null is a different
+        request. An id the account does not have is refused with 400
+        MINTYS_TEMPLATE_UNKNOWN before anything is created, never swapped for the default.
 
         Returns the final attachment dict. Per-file provenance (watermark_id, content_class,
         vetting verdict) lives under `files[]` once processing completes.
         """
+        if ai_declaration not in AI_DECLARATIONS:
+            raise OnmintApiError(
+                f"ai_declaration must be one of {list(AI_DECLARATIONS)}, got {ai_declaration!r}")
+
+        disclosure = {
+            "declaration": ai_declaration,
+            # Sent explicitly rather than omitted. An absent entry is an answer the server
+            # has to assume, and "did not say" and "said no" are different statements — most
+            # of all for training rights, where an unstated entry reads to a scraper as no
+            # objection recorded.
+            "visible_ai_label": visible_ai_label,
+            "allow_ai_training_and_mining": allow_ai_training_and_mining,
+        }
+        if non_ai_medium is not None:
+            disclosure["non_ai_medium"] = non_ai_medium
+
         create_body = {
             "name": name or filename,
             "stream_id": stream_id,
             "ledger": ledger or settings.DEFAULT_LEDGER,
             "filename": filename,
             "estimated_size": len(file_bytes),
+            "ai_disclosure": disclosure,
         }
-        if declared_ai is not None:
-            create_body["declared_ai"] = declared_ai
         if title is not None:
             create_body["title"] = title
         if category is not None:
             create_body["category"] = category
+        if label_template is not None:
+            create_body["label_template"] = label_template
 
         created = await self._json("POST", "/authenticity/attachments", json=create_body)
         attachment_id = created["id"]
@@ -166,6 +235,89 @@ class OnmintClient:
             raise OnmintApiError(f"IPFS fetch {cid} -> {resp.status_code}")
         return resp.content
 
+    # ------------------------------------------------------------ mintys jobs
+    async def submit_mintys_job(self,
+                                file_bytes: bytes,
+                                filename: str,
+                                ai_declaration: Optional[str] = None,
+                                auto_label: bool = False,
+                                visible_label: bool = False,
+                                label_position: Optional[str] = None,
+                                label_variant: Optional[str] = None,
+                                label_template: Optional[str] = None,
+                                title: Optional[str] = None,
+                                description: Optional[str] = None) -> dict:
+        """POST /mintys/jobs: one image or one zip, one set of answers for every entry.
+
+        `ai_declaration` and `auto_label` are two answers to one question and exactly one is
+        required; checked here for a clearer error than the API's 400, which stays the
+        authority. Optional fields go on the form only when given — above all
+        `label_template`, where an absent field is what means "the organization's default".
+        Returns the 202 body: job_id, accepted, total, credits_reserved.
+        """
+        if auto_label and ai_declaration is not None:
+            raise OnmintApiError("send ai_declaration OR auto_label=true, not both")
+        if not auto_label and ai_declaration is None:
+            raise OnmintApiError("ai_declaration is required unless auto_label=true")
+        if ai_declaration is not None and ai_declaration not in AI_DECLARATIONS:
+            raise OnmintApiError(
+                f"ai_declaration must be one of {list(AI_DECLARATIONS)}, got {ai_declaration!r}")
+
+        form = {"auto_label": _flag(auto_label), "visible_label": _flag(visible_label)}
+        optional = {"ai_disclosure": ai_declaration, "label_position": label_position,
+                    "label_variant": label_variant, "label_template": label_template,
+                    "title": title, "description": description}
+        form.update({k: str(v) for k, v in optional.items() if v is not None})
+        files = {"file": (filename, file_bytes, _mime(filename))}
+        return await self._json("POST", "/mintys/jobs", data=form, files=files)
+
+    async def get_mintys_job(self, job_id: str) -> dict:
+        return await self._json("GET", f"/mintys/jobs/{job_id}")
+
+    async def wait_mintys_job(self, job_id: str) -> dict:
+        """Poll until the job has finished: FAILED, or DONE with its result ready to download.
+
+        A job is DONE even when some entries failed (the rows say which); FAILED means none
+        succeeded. DONE is not enough on its own because the result may still be assembling.
+        """
+        waited = 0.0
+        while waited <= settings.POLL_TIMEOUT_SECONDS:
+            job = await self.get_mintys_job(job_id)
+            status = job.get("status")
+            if status == "FAILED" or (status == "DONE" and job.get("result_available")):
+                return job
+            await asyncio.sleep(settings.POLL_INTERVAL_SECONDS)
+            waited += settings.POLL_INTERVAL_SECONDS
+        raise OnmintApiError(f"timed out waiting for mintys job {job_id} to finish")
+
+    async def get_mintys_job_result(self, job_id: str) -> tuple[bytes, str, str]:
+        """The labelled output: (bytes, filename, content type). 409 while the job is still
+        running, 410 once the temporary result has expired."""
+        path = f"/mintys/jobs/{job_id}/result"
+        async with self._client() as c:
+            resp = await c.get(f"{self._base}{path}", headers=self._headers)
+        _raise_for("GET", path, resp)
+        filename = _disposition_filename(resp.headers.get("content-disposition"))
+        content_type = resp.headers.get("content-type", "application/octet-stream")
+        return resp.content, filename or f"mintys-job-{job_id}.zip", content_type
+
+    async def delete_mintys_job(self, job_id: str) -> None:
+        await self._json("DELETE", f"/mintys/jobs/{job_id}")
+
+    # ------------------------------------------------------------ label templates
+    async def list_label_templates(self) -> dict:
+        """The organization's LABEL templates (how the visible AI label looks), reduced to what
+        a caller needs to choose one: id, name, and which one is the default.
+
+        Unrelated to `list_templates`, which lists ASSET templates for provisioning.
+        """
+        raw = await self._json("GET", "/mintys/label-templates")
+        items = raw.get("content", []) if isinstance(raw, dict) else (raw or [])
+        templates = [{"id": t.get("id"), "name": t.get("name"),
+                      "is_default": bool(t.get("is_default"))} for t in items]
+        default = next((t["id"] for t in templates if t["is_default"]), None)
+        return {"templates": templates, "default_id": default}
+
     # -------------------------------------------- provisioning (templates/vaults/streams)
     async def list_templates(self, page: int = 1, page_size: int = 20,
                              public: bool = False, search_term: str = "") -> Optional[dict]:
@@ -242,6 +394,20 @@ def _id_of(obj: Optional[dict]) -> str:
         if nested.get("id"):
             return nested["id"]
     raise OnmintApiError(f"no id in provisioning response: {list(obj)[:6]}")
+
+
+def _flag(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _disposition_filename(header: Optional[str]) -> Optional[str]:
+    """The filename of a Content-Disposition header (plain `filename`, or `filename*` alone)."""
+    if not header:
+        return None
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["content-disposition"] = header
+    return msg.get_filename()
 
 
 def _mime(filename: str) -> str:

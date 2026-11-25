@@ -1,0 +1,262 @@
+name: Build and Deploy to Scaleway K8s
+
+# One deploy at a time per branch. Two pushes in quick succession used to interleave
+# sed / apply / migrate against the same Deployment. Never cancel a running deploy:
+# a half-applied rollout is worse than a queued one.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+# Mirrors the deploy workflow every other on:mint service uses (onmint-service-nft is the
+# reference). Two differences, both because of what this service is:
+#   - no database, so no migration step;
+#   - a `test` gate ahead of the build. This server is the one process that serves every
+#     tenant, and its credential isolation is exactly the kind of property that breaks
+#     silently, so the hosted-transport suite runs before anything is pushed.
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+  pull_request:
+    branches:
+      - dev
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image tag version (defaults to git SHA)'
+        required: false
+        default: ''
+      environment:
+        description: 'Target environment (auto-detected from branch if empty)'
+        required: false
+        type: choice
+        options:
+          - ''
+          - dev
+          - prod
+
+env:
+  REGISTRY: rg.fr-par.scw.cloud
+  IMAGE_NAME: onmint-mcp
+  K8S_NAMESPACE: onmint
+  K8S_DEPLOYMENT: onmint-mcp
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest -q
+
+  set-env:
+    name: Determine Environment
+    runs-on: ubuntu-24.04
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      registry_namespace: ${{ steps.env.outputs.registry_namespace }}
+      k8s_manifests_path: ${{ steps.env.outputs.k8s_manifests_path }}
+      k8s_ref: ${{ steps.env.outputs.k8s_ref }}
+      mcp_url: ${{ steps.env.outputs.mcp_url }}
+    steps:
+      - name: Set environment variables
+        id: env
+        run: |
+          # Determine environment from input or branch
+          if [ -n "${{ github.event.inputs.environment }}" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+            # A manual run can target any branch, so a prod selection must be proven
+            # to come from main. Fail loudly rather than silently deploying to dev.
+            if [ "$ENV" = "prod" ] && [ "${{ github.ref }}" != "refs/heads/main" ]; then
+              echo "::error::Refusing to deploy to prod from '${{ github.ref }}'. Manual prod deploys are only permitted from refs/heads/main. Re-run this workflow with ref=main, or select the 'dev' environment."
+              exit 1
+            fi
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            ENV="prod"
+          else
+            ENV="dev"
+          fi
+
+          echo "environment=$ENV" >> "$GITHUB_OUTPUT"
+
+          if [ "$ENV" = "prod" ]; then
+            echo "registry_namespace=onmint-prod-registry" >> "$GITHUB_OUTPUT"
+            echo "k8s_manifests_path=environments/prod/services/onmint-mcp" >> "$GITHUB_OUTPUT"
+            echo "k8s_ref=main" >> "$GITHUB_OUTPUT"
+            echo "mcp_url=https://api.app.onmint.io/mcp" >> "$GITHUB_OUTPUT"
+          else
+            echo "registry_namespace=onmint-container-registry" >> "$GITHUB_OUTPUT"
+            echo "k8s_manifests_path=environments/dev/services/onmint-mcp" >> "$GITHUB_OUTPUT"
+            echo "k8s_ref=dev" >> "$GITHUB_OUTPUT"
+            echo "mcp_url=https://api.dev-onmint.com/mcp" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-24.04
+    needs: [test, set-env]
+    # Pull requests get the test gate and a build check, but never push an image or deploy.
+    if: github.event_name != 'pull_request'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Scaleway Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: nologin
+          password: ${{ needs.set-env.outputs.environment == 'prod' && secrets.SCW_SECRET_KEY_PROD || secrets.SCW_SECRET_KEY_DEV }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ needs.set-env.outputs.registry_namespace }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=${{ github.event.inputs.version }},enable=${{ github.event.inputs.version != '' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-24.04
+    needs: [set-env, build-and-push]
+    steps:
+      - name: Checkout k8s-deployments repo
+        uses: actions/checkout@v4
+        with:
+          repository: onmint/filedgr-k8s-deployments
+          # Pin the manifests to the branch matching the target env; without a ref this
+          # reads the default branch (main), silently ignoring dev-branch manifests.
+          ref: ${{ needs.set-env.outputs.k8s_ref }}
+          token: ${{ secrets.GH_PAT }}
+          path: k8s-deployments
+
+      - name: Install Scaleway CLI
+        # Pinned and downloaded directly, NOT via scaleway-cli's get.sh. That script asks
+        # the GitHub API for the latest release unauthenticated, so it is rate limited by
+        # the shared Actions runner IP - it answered "Unable to find the latest
+        # linux_amd64 release" and failed a deploy whose image had already been built and
+        # pushed. Nothing about a deploy should depend on an anonymous API call, and a
+        # deploy tool that silently upgrades itself on every run is not reproducible
+        # either. Bump SCW_CLI_VERSION deliberately.
+        env:
+          SCW_CLI_VERSION: 2.61.0
+        run: |
+          set -euo pipefail
+          asset="scaleway-cli_${SCW_CLI_VERSION}_linux_amd64"
+          base="https://github.com/scaleway/scaleway-cli/releases/download/v${SCW_CLI_VERSION}"
+
+          curl -fsSL --retry 3 --retry-delay 5 -o scw "${base}/${asset}"
+          curl -fsSL --retry 3 --retry-delay 5 -o SHA256SUMS "${base}/SHA256SUMS"
+
+          # Catches a truncated or half-written download, which otherwise surfaces much
+          # later as an unreadable error from a binary that will not run.
+          sum=$(awk -v a="$asset" '$2 == a { print $1 }' SHA256SUMS)
+          if [ -z "$sum" ]; then
+            echo "::error::No checksum for $asset in the v${SCW_CLI_VERSION} SHA256SUMS."
+            exit 1
+          fi
+          echo "$sum  scw" | sha256sum -c -
+
+          chmod +x scw
+          sudo mv scw /usr/local/bin/scw
+          scw version
+
+      - name: Configure Scaleway CLI
+        run: |
+          if [ "${{ needs.set-env.outputs.environment }}" = "prod" ]; then
+            scw init secret-key=${{ secrets.SCW_SECRET_KEY_PROD }} access-key=${{ secrets.SCW_ACCESS_KEY_PROD }} install-autocomplete=false send-telemetry=false with-ssh-key=false region=fr-par zone=fr-par-1 organization-id=${{ secrets.SCW_ORGANIZATION_ID_PROD }} project-id=${{ secrets.SCW_DEFAULT_PROJECT_ID_PROD }}
+          else
+            scw init secret-key=${{ secrets.SCW_SECRET_KEY_DEV }} access-key=${{ secrets.SCW_ACCESS_KEY_DEV }} install-autocomplete=false send-telemetry=false with-ssh-key=false region=fr-par zone=fr-par-1 organization-id=${{ secrets.SCW_ORGANIZATION_ID_DEV }} project-id=${{ secrets.SCW_DEFAULT_PROJECT_ID_DEV }}
+          fi
+
+      - name: Get Kubeconfig
+        run: |
+          if [ "${{ needs.set-env.outputs.environment }}" = "prod" ]; then
+            scw k8s kubeconfig install ${{ secrets.SCW_K8S_CLUSTER_ID_PROD }}
+          else
+            scw k8s kubeconfig install ${{ secrets.SCW_K8S_CLUSTER_ID }}
+          fi
+
+      - name: Update image tag in manifests
+        run: |
+          cd k8s-deployments/${{ needs.set-env.outputs.k8s_manifests_path }}
+          sed -i "s|image: .*onmint-mcp:.*|image: ${{ env.REGISTRY }}/${{ needs.set-env.outputs.registry_namespace }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image_tag }}|g" deployment.yaml
+          grep 'image:' deployment.yaml
+
+      - name: Apply Kubernetes manifests
+        run: |
+          cd k8s-deployments/${{ needs.set-env.outputs.k8s_manifests_path }}
+          kubectl apply -f configmap.yaml
+          kubectl apply -f deployment.yaml
+          kubectl apply -f service.yaml
+          kubectl apply -f ingress.yaml
+
+      - name: Restart deployment to pull new image
+        run: |
+          kubectl rollout restart deployment/${{ env.K8S_DEPLOYMENT }} -n ${{ env.K8S_NAMESPACE }}
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT }} -n ${{ env.K8S_NAMESPACE }} --timeout=300s
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=${{ env.K8S_DEPLOYMENT }}
+          echo "---"
+          kubectl get deployment ${{ env.K8S_DEPLOYMENT }} -n ${{ env.K8S_NAMESPACE }}
+
+      - name: Smoke test the MCP endpoint through the ingress
+        run: |
+          # A real MCP `initialize` over the public URL, not a health ping. The health
+          # endpoints are not routed publicly (only /mcp is), and more importantly a 200 from
+          # a health handler would not prove the thing that actually breaks here: that
+          # Traefik routes /mcp to this service rather than to the webapp BFF's catch-all `/`
+          # router on the same host, and that the server answers the protocol. Deliberately
+          # unauthenticated — `initialize` needs no credentials, which is what lets a client
+          # connect before it has any.
+          sleep 15
+          BODY='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"1"}}}'
+          RESPONSE=$(curl -sS --max-time 30 \
+            -X POST "${{ needs.set-env.outputs.mcp_url }}" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d "$BODY")
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"serverInfo"' \
+            || { echo "MCP initialize did not return a serverInfo result"; exit 1; }
+          echo "$RESPONSE" | grep -q 'onmint-authenticity' \
+            || { echo "/mcp is being served by something other than onmint-mcp"; exit 1; }

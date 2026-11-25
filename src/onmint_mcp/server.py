@@ -2,12 +2,18 @@
 on:mint authenticity MCP server.
 
 Exposes the authenticity API as MCP tools so AI tools and developers can, from any MCP
-client: submit content (the mandatory AI check decides protect-vs-label), explicitly attach
-an AI-Act label to AI-generated output, protect an original, and verify/analyze any image.
+client: submit content with an AI declaration, explicitly attach an AI-Act label to
+AI-generated output, protect an original, and verify/analyze any image. mintys customers
+label an image or a zip batch through the mintys job pipeline (`mintys_label_images`).
 
-Design note: the AI check ALWAYS runs server-side and its result decides the mode. A tool
-like `label_ai_output` records the caller's "this is AI" claim (recommended for AI-tool
-providers under the EU AI Act), but detection — not the claim — sets the final label.
+Design note: the AI label is DECLARED, not detected. Every submit tool sends an
+`ai_declaration` and that declaration is what gets signed into the C2PA manifest. The AI
+detector still runs server-side, and its reading is reported alongside the declaration as a
+secondary "automated assessment" that never overrides it.
+
+`submit_content` therefore REQUIRES the declaration from its caller. `label_ai_output` and
+`protect_original` hardcode one — that is what those two tools ARE, exactly as they already
+hardcoded the old `declared_ai` boolean.
 """
 import base64
 import os
@@ -15,18 +21,49 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from onmint_mcp import settings
+from onmint_mcp import http_auth, settings
 from onmint_mcp.client import OnmintClient
 
-mcp = FastMCP("onmint-authenticity")
+# host/port/stateless are passed here rather than left to the environment: FastMCP forwards
+# its own constructor defaults into pydantic-settings as init arguments, which outrank env
+# vars, so FASTMCP_HOST and friends are silently ignored. stateless_http is what makes
+# per-request credentials safe — see the http_auth module docstring.
+mcp = FastMCP(
+    "onmint-authenticity",
+    host=settings.SERVER_HOST,
+    port=settings.SERVER_PORT,
+    streamable_http_path=settings.STREAMABLE_HTTP_PATH,
+    stateless_http=True,
+)
 
 
 def _client() -> OnmintClient:
+    """Build a client for whoever is calling.
+
+    Hosted, that is the API key on the in-flight HTTP request and never a server-wide
+    credential. Over stdio the process belongs to one user, so the environment is the
+    caller's own configuration and OnmintClient's defaults apply.
+    """
+    if settings.HOSTED:
+        api_key, api_secret = http_auth.require_credentials()
+        return OnmintClient(api_key=api_key, api_secret=api_secret)
     return OnmintClient()
+
+
+def _reject_local_path(argument: str, value: Optional[str]) -> None:
+    """Refuse a filesystem argument when 'the filesystem' is the server's, not the caller's."""
+    if value and settings.HOSTED:
+        raise ValueError(
+            f"`{argument}` refers to a local file path and is not available on the hosted "
+            "on:mint MCP server — the path would be read from (or written to) the server's "
+            "own disk, not yours. Send the bytes as `image_base64` instead, and take the "
+            "credentialed file back with `return_file=true`."
+        )
 
 
 def _load(image_path: Optional[str], image_base64: Optional[str], filename: Optional[str]):
     """Resolve image bytes from a local path or a base64 string (exactly one required)."""
+    _reject_local_path("image_path", image_path)
     if image_path:
         with open(image_path, "rb") as f:
             return f.read(), filename or os.path.basename(image_path)
@@ -43,9 +80,15 @@ def _summary(attachment: dict) -> dict:
     mode = None
     if content_class:
         mode = "labeled" if content_class in ("AI_EDITED", "AI_GENERATED") else "protected"
+    disclosure = attachment.get("ai_disclosure") or {}
     return {
         "attachment_id": attachment.get("id"),
         "status": attachment.get("status"),
+        # The authoritative label: what the rights holder declared and we signed. NOT_DECLARED
+        # on an asset minted before declarations were required — that is the honest record for
+        # those, and it must never be reported as "created without AI".
+        "ai_declaration": disclosure.get("declaration"),
+        "visible_ai_label": disclosure.get("visible_ai_label"),
         "declared_ai": attachment.get("declared_ai"),
         "watermark_id": first.get("watermark_id"),
         "content_class": content_class,
@@ -56,14 +99,19 @@ def _summary(attachment: dict) -> dict:
 
 
 async def _submit(stream_id, image_path, image_base64, filename, name, title, category,
-                  declared_ai, wait, return_file=False, save_to=None) -> dict:
+                  ai_declaration, wait, return_file=False, save_to=None,
+                  visible_ai_label=False, allow_ai_training_and_mining=False,
+                  label_template=None) -> dict:
     data, fname = _load(image_path, image_base64, filename)
+    _reject_local_path("save_to", save_to)
     client = _client()
     if not stream_id:
         stream_id = await client.ensure_stream()
     attachment = await client.submit_and_wait(
         stream_id=stream_id, file_bytes=data, filename=fname, name=name,
-        declared_ai=declared_ai, title=title, category=category, wait=wait,
+        ai_declaration=ai_declaration, visible_ai_label=visible_ai_label,
+        allow_ai_training_and_mining=allow_ai_training_and_mining,
+        title=title, category=category, wait=wait, label_template=label_template,
     )
     result = _summary(attachment)
     wmid = result.get("watermark_id")
@@ -91,25 +139,48 @@ async def _submit(stream_id, image_path, image_base64, filename, name, title, ca
 
 
 @mcp.tool()
-async def submit_content(stream_id: Optional[str] = None,
+async def submit_content(ai_declaration: str,
+                         stream_id: Optional[str] = None,
                          image_path: Optional[str] = None,
                          image_base64: Optional[str] = None,
                          filename: Optional[str] = None,
                          name: Optional[str] = None,
                          title: Optional[str] = None,
                          category: Optional[str] = None,
-                         declared_ai: Optional[bool] = None,
+                         visible_ai_label: bool = False,
+                         allow_ai_training_and_mining: bool = False,
                          wait: bool = True,
                          return_file: bool = False,
-                         save_to: Optional[str] = None) -> dict:
-    """Submit an image for authenticity processing. The mandatory AI check runs first and
-    its result decides the mode: an original is protected; AI-edited/AI-generated content is
-    labeled per the EU AI Act. `declared_ai` optionally records your upfront claim (does not
-    override detection). `stream_id` is optional — if omitted, a stream is reused/provisioned
-    automatically. Set `return_file` (or `save_to`) to get the credentialed file back. Returns
-    the final status, provenance, and share/verify URLs."""
+                         save_to: Optional[str] = None,
+                         label_template: Optional[str] = None) -> dict:
+    """Submit an image for authenticity processing: invisible watermark + signed C2PA Content
+    Credentials + on-chain anchor.
+
+    `ai_declaration` is REQUIRED and has no default — it is the authoritative AI label and it
+    is signed into the credentials, so ASK THE USER rather than inferring it from the file.
+    One of CREATED_WITHOUT_AI, AI_ENHANCED, AI_MODIFIED, AI_GENERATED. Submitting without it
+    is rejected by the API and costs nothing.
+
+    `visible_ai_label` burns the visible AI label into the pixels; it is only accepted for
+    AI_MODIFIED / AI_GENERATED. `allow_ai_training_and_mining` (default false = refuse) writes
+    the standard c2pa.training-mining assertion.
+
+    An AI detector still runs and is reported alongside the declaration as a secondary
+    automated assessment; it never overrides what was declared. `stream_id` is optional — if
+    omitted, a stream is reused/provisioned automatically. Set `return_file` (or `save_to`) to
+    get the credentialed file back. Returns the final status, provenance, and verify URLs.
+
+    `label_template`: id of one of the organization's label templates; it sets how the
+    visible AI label LOOKS (artwork, frame, colour, logo), never what it says, and only shows
+    when a visible label is drawn (`visible_ai_label=true`). Omit it to use
+    the organization's default. Call `list_label_templates` to find an id. An unknown id is
+    refused (MINTYS_TEMPLATE_UNKNOWN) and nothing is submitted or labelled with a substitute.
+    """
     return await _submit(stream_id, image_path, image_base64, filename, name, title, category,
-                         declared_ai, wait, return_file=return_file, save_to=save_to)
+                         ai_declaration, wait, return_file=return_file, save_to=save_to,
+                         visible_ai_label=visible_ai_label,
+                         allow_ai_training_and_mining=allow_ai_training_and_mining,
+                         label_template=label_template)
 
 
 @mcp.tool()
@@ -120,16 +191,40 @@ async def label_ai_output(image_path: Optional[str] = None,
                           name: Optional[str] = None,
                           title: Optional[str] = None,
                           category: Optional[str] = None,
+                          ai_declaration: str = "AI_GENERATED",
+                          visible_ai_label: bool = False,
+                          allow_ai_training_and_mining: bool = False,
                           wait: bool = True,
                           return_file: bool = True,
-                          save_to: Optional[str] = None) -> dict:
+                          save_to: Optional[str] = None,
+                          label_template: Optional[str] = None) -> dict:
     """Attach a secure AI label to AI-generated output (for AI-tool providers, EU AI Act Art.
-    50) and get the credentialed file back. Submits with declared_ai=true; the AI check still
-    runs and, for genuine AI content, emits a C2PA digitalSourceType marking + AI-tagged
-    watermark. `stream_id` is optional (auto-provisioned). By default returns the labeled file
-    bytes (base64) plus provenance and a public verify URL; pass save_to to also write it out."""
+    50) and get the credentialed file back.
+
+    Declares AI_GENERATED by default — that is what this tool is for, exactly as it used to
+    hardcode declared_ai=true. Override `ai_declaration` with AI_MODIFIED if AI changed an
+    existing asset rather than generating it from nothing; the other two values are not
+    appropriate here and `protect_original` is the tool for them.
+
+    The declaration is signed into the C2PA manifest as an IPTC digitalSourceType and encoded
+    in the watermark. Set `visible_ai_label=true` to also burn the visible label into the
+    pixels. `stream_id` is optional (auto-provisioned). By default returns the labeled file
+    bytes (base64) plus provenance and a public verify URL; pass save_to to also write it out.
+
+    This is the on:mint pipeline (stream, IPFS, on-chain anchor). mintys customers labelling
+    an image or a zip batch use `mintys_label_images` instead.
+
+    `label_template`: id of one of the organization's label templates; it sets how the
+    visible AI label LOOKS (artwork, frame, colour, logo), never what it says, and only shows
+    when a visible label is drawn (`visible_ai_label=true`). Omit it to use
+    the organization's default. Call `list_label_templates` to find an id. An unknown id is
+    refused (MINTYS_TEMPLATE_UNKNOWN) and nothing is submitted or labelled with a substitute.
+    """
     return await _submit(stream_id, image_path, image_base64, filename, name, title, category,
-                         declared_ai=True, wait=wait, return_file=return_file, save_to=save_to)
+                         ai_declaration, wait=wait, return_file=return_file, save_to=save_to,
+                         visible_ai_label=visible_ai_label,
+                         allow_ai_training_and_mining=allow_ai_training_and_mining,
+                         label_template=label_template)
 
 
 @mcp.tool()
@@ -140,15 +235,39 @@ async def protect_original(image_path: Optional[str] = None,
                            name: Optional[str] = None,
                            title: Optional[str] = None,
                            category: Optional[str] = None,
+                           ai_declaration: str = "CREATED_WITHOUT_AI",
+                           allow_ai_training_and_mining: bool = False,
                            wait: bool = True,
                            return_file: bool = False,
-                           save_to: Optional[str] = None) -> dict:
-    """Protect an original (authored/captured) asset: submits with declared_ai=false. The AI
-    check still runs — if it detects AI content, the asset is labeled AI instead (detection
-    decides). `stream_id` is optional (auto-provisioned). Returns the final status, provenance,
-    and share/verify URLs; set return_file/save_to to also get the credentialed file."""
+                           save_to: Optional[str] = None,
+                           label_template: Optional[str] = None) -> dict:
+    """Protect an original (authored/captured) asset.
+
+    Declares CREATED_WITHOUT_AI by default — that is what this tool is for, exactly as it used
+    to hardcode declared_ai=false. Override with AI_ENHANCED if the asset was retouched,
+    upscaled or denoised with AI: the content is still what was captured, and it is still
+    protected rather than labelled, but the declaration should say so. Only use this tool if
+    the user has confirmed it; do not assume a file is AI-free because it looks like a photo.
+
+    Our detector still runs and is reported as a secondary automated assessment. It does NOT
+    override the declaration any more — if it disagrees, both readings are published and the
+    disagreement is visible, which is the information a reviewer needs.
+
+    `stream_id` is optional (auto-provisioned). Returns the final status, provenance, and
+    verify URLs; set return_file/save_to to also get the credentialed file.
+
+    `label_template` is accepted for parity but changes nothing visible here: this tool draws
+    no visible label. It is still validated, so an unknown id is still refused.
+
+    `label_template`: id of one of the organization's label templates; it sets how the
+    visible AI label LOOKS (artwork, frame, colour, logo), never what it says. Omit it to use
+    the organization's default. Call `list_label_templates` to find an id. An unknown id is
+    refused (MINTYS_TEMPLATE_UNKNOWN) and nothing is submitted or labelled with a substitute.
+    """
     return await _submit(stream_id, image_path, image_base64, filename, name, title, category,
-                         declared_ai=False, wait=wait, return_file=return_file, save_to=save_to)
+                         ai_declaration, wait=wait, return_file=return_file, save_to=save_to,
+                         allow_ai_training_and_mining=allow_ai_training_and_mining,
+                         label_template=label_template)
 
 
 @mcp.tool()
@@ -166,9 +285,15 @@ async def verify_image(image_path: Optional[str] = None,
 async def analyze_image(image_path: Optional[str] = None,
                         image_base64: Optional[str] = None,
                         filename: Optional[str] = None) -> dict:
-    """Report how much AI content an image holds: AI-generated probability + label, plus the
-    per-signal breakdown (faces, NSFW, EXIF/ELA manipulation). Works on any image. These are
-    calibrated estimates from open detectors, not ground-truth verdicts."""
+    """Report the AI signals an image carries: `ai_signal_assessment` gives one of three tiers
+    (no / isolated / clear AI signals detected), plus the per-signal breakdown (faces, NSFW,
+    EXIF/ELA manipulation). Works on any image.
+
+    The old `ai_content_share` percentage has been REMOVED — it was read as "this share of the
+    image is AI", which is not what the detector measures. The raw score is still available
+    under `ai_signal_assessment.score` and `ai_generated_probability` for a technical view.
+    Present all of it as an automated assessment, never as a verdict about the asset: the
+    asset's AI label is its rights holder's declaration, not a detector's opinion."""
     data, fname = _load(image_path, image_base64, filename)
     return await _client().analyze(file_bytes=data, filename=fname)
 
@@ -193,6 +318,157 @@ async def get_provenance(watermark_id: Optional[str] = None,
     raise ValueError("Provide either watermark_id or sha256.")
 
 
+# ============================================================ mintys jobs
+# mintys is its own pipeline, not a mode of the on:mint one: no stream, no IPFS pin, no
+# on-chain anchor, one declaration (or auto_label) per job, and the output comes back as a
+# download that expires. Folding it into label_ai_output would silently change that tool's
+# inputs and its return shape, so it is a tool of its own and each docstring names the other.
+def _mintys_template(job: dict) -> dict:
+    """The template applied to a job, as {id, name}, whichever shape the API reports it in."""
+    nested = job.get("label_template")
+    if isinstance(nested, dict):
+        return {"id": nested.get("id"), "name": nested.get("name")}
+    return {"id": job.get("label_template_id"), "name": job.get("label_template_name")}
+
+
+def _mintys_summary(job: dict) -> dict:
+    items = job.get("items") or []
+    failed = [{"filename": i.get("filename"), "failure_reason": i.get("failure_reason"),
+               "failure_detail": i.get("failure_detail")}
+              for i in items if i.get("status") == "FAILED"]
+    return {
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "total": job.get("total"),
+        "done": job.get("done"),
+        "skipped": job.get("skipped"),
+        "failed": job.get("failed"),
+        "failed_items": failed,
+        "credits_spent": job.get("credits_spent"),
+        "label_template": _mintys_template(job),
+        "result_available": job.get("result_available"),
+        "expires_at": job.get("expires_at"),
+    }
+
+
+async def _attach_mintys_result(client: OnmintClient, result: dict, job_id: str,
+                                return_file: bool, save_to: Optional[str]) -> dict:
+    if not (return_file or save_to):
+        return result
+    try:
+        data, name, content_type = await client.get_mintys_job_result(job_id)
+    except Exception as ex:  # the job itself is reported either way
+        result["result_error"] = str(ex)
+        return result
+    if save_to:
+        with open(save_to, "wb") as fh:
+            fh.write(data)
+        result["saved_to"] = save_to
+    if return_file:
+        result["result_file_base64"] = base64.b64encode(data).decode()
+        result["result_file_name"] = name
+        result["result_content_type"] = content_type
+    return result
+
+
+@mcp.tool()
+async def mintys_label_images(image_path: Optional[str] = None,
+                              image_base64: Optional[str] = None,
+                              filename: Optional[str] = None,
+                              ai_declaration: Optional[str] = None,
+                              auto_label: bool = False,
+                              visible_label: bool = False,
+                              label_position: Optional[str] = None,
+                              label_variant: Optional[str] = None,
+                              label_template: Optional[str] = None,
+                              title: Optional[str] = None,
+                              description: Optional[str] = None,
+                              wait: bool = True,
+                              return_file: bool = True,
+                              save_to: Optional[str] = None) -> dict:
+    """mintys: label one image, or a .zip of images, through the mintys job pipeline (AI
+    check, visible EU AI Act label, invisible watermark, signed C2PA credentials). For mintys
+    customers. No stream, IPFS or on-chain anchor; for that on:mint pipeline use
+    `label_ai_output` instead.
+
+    Exactly one of `ai_declaration` (CREATED_WITHOUT_AI, AI_ENHANCED, AI_MODIFIED,
+    AI_GENERATED; applied to EVERY file in the upload, so ask the user) or `auto_label=true`
+    (the AI check decides per file; a file it clears comes back SKIPPED, which is a success).
+    `visible_label=true` burns in the visible label; `label_position` is top_right (default),
+    top_left, bottom_right or bottom_left; omit `label_variant` to pick it automatically.
+    Sending base64, set `filename` (e.g. batch.zip) so the type is known.
+
+    `label_template`: id of one of the organization's label templates; it sets how the
+    visible label LOOKS (artwork, frame, colour, logo), never what it says, and applies to
+    the whole job. Omit it to use the organization's default. Call `list_label_templates` to
+    find an id. An unknown id is refused (MINTYS_TEMPLATE_UNKNOWN) and nothing is labelled
+    with a substitute. The applied template's id and name are recorded on the job and
+    returned as `label_template`.
+
+    With `wait=true` (default) polls until the job finishes and returns counts, failed files,
+    the applied template and, with `return_file` (default) or `save_to`, the labelled output
+    (a zip for a zip upload). With `wait=false` returns the job id at once; follow up with
+    `get_mintys_job`. The output is temporary: download it before `expires_at`."""
+    data, fname = _load(image_path, image_base64, filename)
+    _reject_local_path("save_to", save_to)
+    client = _client()
+    accepted = await client.submit_mintys_job(
+        file_bytes=data, filename=fname, ai_declaration=ai_declaration, auto_label=auto_label,
+        visible_label=visible_label, label_position=label_position,
+        label_variant=label_variant, label_template=label_template, title=title,
+        description=description)
+    job_id = str(accepted["job_id"])
+    if not wait:
+        result = _mintys_summary(await client.get_mintys_job(job_id))
+        result.update(accepted=accepted.get("accepted"),
+                      credits_reserved=accepted.get("credits_reserved"))
+        return result
+    result = _mintys_summary(await client.wait_mintys_job(job_id))
+    result.update(accepted=accepted.get("accepted"),
+                  credits_reserved=accepted.get("credits_reserved"))
+    return await _attach_mintys_result(client, result, job_id, return_file, save_to)
+
+
+@mcp.tool()
+async def get_mintys_job(job_id: str, return_file: bool = False,
+                         save_to: Optional[str] = None) -> dict:
+    """mintys: progress of a job from `mintys_label_images` (e.g. one submitted with
+    wait=false): status, done/skipped/failed counts, failed files, and the label template
+    applied (`label_template` {id, name}). Set `return_file` or `save_to` to also fetch the
+    labelled output once `result_available` is true; before that, or after `expires_at`, the
+    download is refused and reported under `result_error`."""
+    _reject_local_path("save_to", save_to)
+    client = _client()
+    result = _mintys_summary(await client.get_mintys_job(job_id))
+    return await _attach_mintys_result(client, result, job_id, return_file, save_to)
+
+
+@mcp.tool()
+async def delete_mintys_job(job_id: str) -> dict:
+    """mintys: delete a job's temporary output now instead of waiting for `expires_at`. An
+    unknown job id is an error, not a success."""
+    await _client().delete_mintys_job(job_id)
+    return {"job_id": job_id, "deleted": True}
+
+
+# ============================================================ Label templates
+# Deliberately NOT named `list_templates`: that tool already exists and lists the asset
+# templates of the provisioning graph. Two tools both called "templates" is how a calling
+# model picks the wrong one without noticing, so the names and the docstrings each say which.
+@mcp.tool()
+async def list_label_templates() -> dict:
+    """List the organization's LABEL templates: how the visible AI label LOOKS (artwork,
+    frame, colour, logo). Returns `templates` [{id, name, is_default}] and `default_id`.
+
+    Pass an `id` from here as `label_template` to mintys_label_images, label_ai_output,
+    submit_content or protect_original. Omitting `label_template` uses the template marked
+    `is_default`; an id not in this list is refused and nothing is labelled with a
+    substitute. Templates are created and edited in the web app, not through this tool.
+
+    Not the asset templates `list_templates` returns; those are a different thing."""
+    return await _client().list_label_templates()
+
+
 # ============================================================ Provisioning (P4)
 # Manage the template -> vault -> stream graph over the API, so a developer can set up a place
 # to submit content without touching the web app.
@@ -211,14 +487,19 @@ async def list_streams(vault_id: str, page: int = 1, page_size: int = 20) -> dic
 @mcp.tool()
 async def list_templates(page: int = 1, page_size: int = 20,
                          public: bool = False, search_term: str = "") -> dict:
-    """List templates available to you (optionally public / filtered by search term)."""
+    """List ASSET templates: step 1 of the template -> vault -> stream graph that on:mint
+    submissions go into (optionally public / filtered by search term).
+
+    NOT label templates. These ids are never valid as `label_template`; for how the visible
+    AI label looks, call `list_label_templates`."""
     return await _client().list_templates(page=page, page_size=page_size,
                                           public=public, search_term=search_term) or {"content": []}
 
 
 @mcp.tool()
 async def create_template(name: str, hint: str = "authenticity", public: bool = False) -> dict:
-    """Create a headless template (step 1 of provisioning a place to submit). Returns the template."""
+    """Create a headless ASSET template (step 1 of provisioning a place to submit). Returns the
+    template. Not a label template: those are created in the web app, not over the API."""
     return await _client().create_template(name=name, hint=hint, public=public)
 
 
@@ -243,8 +524,42 @@ async def ensure_stream() -> dict:
     return {"stream_id": await _client().ensure_stream()}
 
 
+# ================================================================== Hosted transport
+# Health endpoints for the Kubernetes probes. `custom_route` registers them outside the MCP
+# protocol and outside any authorization, which is what a probe needs: the kubelet has no
+# credentials and speaks HTTP, not MCP. They deliberately do no I/O — the API this server
+# fronts is a dependency, not part of this process's liveness, and a probe that failed when
+# the API had a bad minute would restart every pod in the middle of it.
+@mcp.custom_route("/health/live", methods=["GET"])
+async def health_live(_request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "alive"})
+
+
+@mcp.custom_route("/health/ready", methods=["GET"])
+async def health_ready(_request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ready"})
+
+
+def http_app():
+    """The hosted ASGI app: the streamable-http MCP endpoint plus per-caller credentials."""
+    http_auth.assert_stateless(mcp)
+    app = mcp.streamable_http_app()
+    app.add_middleware(http_auth.CallerCredentialsMiddleware)
+    return app
+
+
 def main() -> None:
-    mcp.run(transport=settings.TRANSPORT)
+    if not settings.HOSTED:
+        mcp.run(transport=settings.TRANSPORT)
+        return
+
+    # Served through uvicorn directly rather than mcp.run("streamable-http") so the
+    # credentials middleware can be wrapped around the app before it starts.
+    import uvicorn
+
+    uvicorn.run(http_app(), host=settings.SERVER_HOST, port=settings.SERVER_PORT)
 
 
 if __name__ == "__main__":
