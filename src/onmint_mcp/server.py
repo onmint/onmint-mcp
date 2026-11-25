@@ -37,6 +37,19 @@ mcp = FastMCP(
 )
 
 
+def _tool(group: str):
+    """Register a tool only when its toolset is enabled (see `settings.TOOLSETS`).
+
+    A tool whose group is switched off is returned as a plain function, so it stays
+    importable and testable but is not advertised to any MCP client.
+    """
+    def deco(fn):
+        if group in settings.TOOLSETS:
+            return mcp.tool()(fn)
+        return fn
+    return deco
+
+
 def _client() -> OnmintClient:
     """Build a client for whoever is calling.
 
@@ -138,7 +151,7 @@ async def _submit(stream_id, image_path, image_base64, filename, name, title, ca
     return result
 
 
-@mcp.tool()
+@_tool("onmint")
 async def submit_content(ai_declaration: str,
                          stream_id: Optional[str] = None,
                          image_path: Optional[str] = None,
@@ -183,7 +196,7 @@ async def submit_content(ai_declaration: str,
                          label_template=label_template)
 
 
-@mcp.tool()
+@_tool("onmint")
 async def label_ai_output(image_path: Optional[str] = None,
                           image_base64: Optional[str] = None,
                           filename: Optional[str] = None,
@@ -227,7 +240,7 @@ async def label_ai_output(image_path: Optional[str] = None,
                          label_template=label_template)
 
 
-@mcp.tool()
+@_tool("onmint")
 async def protect_original(image_path: Optional[str] = None,
                            image_base64: Optional[str] = None,
                            filename: Optional[str] = None,
@@ -270,7 +283,7 @@ async def protect_original(image_path: Optional[str] = None,
                          label_template=label_template)
 
 
-@mcp.tool()
+@_tool("onmint")
 async def verify_image(image_path: Optional[str] = None,
                        image_base64: Optional[str] = None,
                        filename: Optional[str] = None) -> dict:
@@ -281,7 +294,7 @@ async def verify_image(image_path: Optional[str] = None,
     return await _client().verify(file_bytes=data, filename=fname)
 
 
-@mcp.tool()
+@_tool("onmint")
 async def analyze_image(image_path: Optional[str] = None,
                         image_base64: Optional[str] = None,
                         filename: Optional[str] = None) -> dict:
@@ -298,14 +311,14 @@ async def analyze_image(image_path: Optional[str] = None,
     return await _client().analyze(file_bytes=data, filename=fname)
 
 
-@mcp.tool()
+@_tool("onmint")
 async def get_status(attachment_id: str) -> dict:
     """Fetch the current status of a submission by attachment id (for wait=false submissions).
     Once finished, per-file provenance (watermark_id, content_class) is populated."""
     return _summary(await _client().get_status(attachment_id))
 
 
-@mcp.tool()
+@_tool("onmint")
 async def get_provenance(watermark_id: Optional[str] = None,
                          sha256: Optional[str] = None) -> dict:
     """Look up an asset's public provenance ('nutrition label') by watermark id or SHA-256:
@@ -371,7 +384,7 @@ async def _attach_mintys_result(client: OnmintClient, result: dict, job_id: str,
     return result
 
 
-@mcp.tool()
+@_tool("mintys")
 async def mintys_label_images(image_path: Optional[str] = None,
                               image_base64: Optional[str] = None,
                               filename: Optional[str] = None,
@@ -429,7 +442,7 @@ async def mintys_label_images(image_path: Optional[str] = None,
     return await _attach_mintys_result(client, result, job_id, return_file, save_to)
 
 
-@mcp.tool()
+@_tool("mintys")
 async def get_mintys_job(job_id: str, return_file: bool = False,
                          save_to: Optional[str] = None) -> dict:
     """mintys: progress of a job from `mintys_label_images` (e.g. one submitted with
@@ -443,7 +456,7 @@ async def get_mintys_job(job_id: str, return_file: bool = False,
     return await _attach_mintys_result(client, result, job_id, return_file, save_to)
 
 
-@mcp.tool()
+@_tool("mintys")
 async def delete_mintys_job(job_id: str) -> dict:
     """mintys: delete a job's temporary output now instead of waiting for `expires_at`. An
     unknown job id is an error, not a success."""
@@ -455,7 +468,7 @@ async def delete_mintys_job(job_id: str) -> dict:
 # Deliberately NOT named `list_templates`: that tool already exists and lists the asset
 # templates of the provisioning graph. Two tools both called "templates" is how a calling
 # model picks the wrong one without noticing, so the names and the docstrings each say which.
-@mcp.tool()
+@_tool("mintys")
 async def list_label_templates() -> dict:
     """List the organization's LABEL templates: how the visible AI label LOOKS (artwork,
     frame, colour, logo). Returns `templates` [{id, name, is_default}] and `default_id`.
@@ -472,19 +485,19 @@ async def list_label_templates() -> dict:
 # ============================================================ Provisioning (P4)
 # Manage the template -> vault -> stream graph over the API, so a developer can set up a place
 # to submit content without touching the web app.
-@mcp.tool()
+@_tool("onmint")
 async def list_vaults(page: int = 1, page_size: int = 20, archived: bool = False) -> dict:
     """List your vaults (paginated). Each vault holds streams that submissions go into."""
     return await _client().list_vaults(page=page, page_size=page_size, archived=archived) or {"content": []}
 
 
-@mcp.tool()
+@_tool("onmint")
 async def list_streams(vault_id: str, page: int = 1, page_size: int = 20) -> dict:
     """List the streams inside a vault. Submit content into a stream's id."""
     return await _client().get_vault_streams(vault_id, page=page, page_size=page_size) or {"content": []}
 
 
-@mcp.tool()
+@_tool("onmint")
 async def list_templates(page: int = 1, page_size: int = 20,
                          public: bool = False, search_term: str = "") -> dict:
     """List ASSET templates: step 1 of the template -> vault -> stream graph that on:mint
@@ -496,20 +509,20 @@ async def list_templates(page: int = 1, page_size: int = 20,
                                           public=public, search_term=search_term) or {"content": []}
 
 
-@mcp.tool()
+@_tool("onmint")
 async def create_template(name: str, hint: str = "authenticity", public: bool = False) -> dict:
     """Create a headless ASSET template (step 1 of provisioning a place to submit). Returns the
     template. Not a label template: those are created in the web app, not over the API."""
     return await _client().create_template(name=name, hint=hint, public=public)
 
 
-@mcp.tool()
+@_tool("onmint")
 async def create_vault(template_id: str, name: str, description: Optional[str] = None) -> dict:
     """Create a vault from a template_id (step 2 — mints on-chain). Returns the vault."""
     return await _client().create_vault(template_id=template_id, name=name, description=description)
 
 
-@mcp.tool()
+@_tool("onmint")
 async def create_stream(vault_id: str, mapping: str = "default",
                         description: Optional[str] = None, required: bool = False) -> dict:
     """Create a stream inside a vault (step 3). Returns the stream; submit content into its id."""
@@ -517,7 +530,7 @@ async def create_stream(vault_id: str, mapping: str = "default",
                                          description=description, required=required)
 
 
-@mcp.tool()
+@_tool("onmint")
 async def ensure_stream() -> dict:
     """Get a ready-to-use stream id with zero setup: reuse an existing stream, or provision a
     template -> vault -> stream. Returns {"stream_id": ...}."""
