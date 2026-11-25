@@ -28,6 +28,11 @@ PUBLIC_APP_URL = os.environ.get("ONMINT_PUBLIC_APP_URL", "https://app.dev.dev-on
 # reuses the first existing vault/stream, else provisions a template->vault->stream.
 DEFAULT_STREAM_ID = os.environ.get("ONMINT_DEFAULT_STREAM_ID", "")
 
+# Which tool groups the server advertises. "onmint" = the on:mint authenticity tools,
+# "mintys" = the mintys job tools (plus list_label_templates). Default is both, so local
+# stdio use is unchanged; a hosted deployment narrows it through its configmap.
+TOOLSETS = {t.strip() for t in os.environ.get("ONMINT_MCP_TOOLSETS", "onmint,mintys").split(",") if t.strip()}
+
 # Transport: "stdio" (default, local) or "streamable-http" (hosted).
 TRANSPORT = os.environ.get("ONMINT_MCP_TRANSPORT", "stdio")
 
